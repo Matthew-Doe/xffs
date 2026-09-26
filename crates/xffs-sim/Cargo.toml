@@ -1,0 +1,12 @@
+[package]
+name = "xffs-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+xffs-core = { path = "../xffs-core" }
+
+[lints]
+workspace = true
