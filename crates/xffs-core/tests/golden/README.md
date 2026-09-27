@@ -3,3 +3,8 @@ count/checksum zero, used payload 24. Generated independently with Python
 `struct.pack_into` at the specification offsets and a bit-at-a-time reflected
 CRC32C polynomial 0x82f63b78 (initial/final XOR 0xffffffff). Every other byte
 is zero. The codec tests compare expected fields and flip every byte in turn.
+
+`root-table.bin` is independently encoded with the same Python packing/bitwise
+CRC procedure: type 5, physical block 516, payload 3840; slot zero is root (0,1),
+linked directory, parent (0,1), timestamps 1700000000, size/allocation/count zero.
+All remaining inode slots and padding are zero.

@@ -21,7 +21,7 @@ pub fn validate_name(bytes: &[u8]) -> Result<&str> {
         .next()
         .unwrap_or("")
         .trim_end_matches([' ', '.'])
-        .to_uppercase();
+        .to_ascii_uppercase();
     if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"].contains(&stem.as_str())
         || ["COM", "LPT"].iter().any(|p| {
             stem.strip_prefix(p).is_some_and(|n| {

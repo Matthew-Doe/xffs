@@ -130,3 +130,6 @@ pub trait BlockDevice {
 
 pub mod format;
 pub mod names;
+
+pub mod reader;
+pub use reader::ReadOnlyFs;

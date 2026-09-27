@@ -471,7 +471,9 @@ pub fn decode_directory(b: &[u8], block: u64, owner: InodeId) -> Result<Vec<Dire
         )?;
         zero(&tail[4..8])?;
         zero(&tail[24 + n..len])?;
-        let name = crate::names::validate_name(&tail[24..24 + n])?.to_owned();
+        let name = crate::names::validate_name(&tail[24..24 + n])
+            .map_err(|_| FsError::Corrupt("invalid directory name"))?
+            .to_owned();
         let child = InodeId {
             index: u64at(tail, 8)?,
             generation: u64at(tail, 16)?,

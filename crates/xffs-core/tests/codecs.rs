@@ -218,3 +218,50 @@ fn malformed_chains_are_bounded() {
     i.overflow = 1;
     assert!(resolve_extents(&i, &l, |_| panic!("must not read forbidden reference")).is_err());
 }
+#[test]
+fn independently_encoded_root_table() {
+    let b = include_bytes!("golden/root-table.bin");
+    let h = decode_block(b, 516).unwrap();
+    assert_eq!(h.kind, Kind::Inodes);
+    assert_eq!(h.used, 3840);
+    let i = Inode::decode(&b[64..320], 0).unwrap().unwrap();
+    assert_eq!(i.id, ROOT);
+    assert_eq!(i.parent, ROOT);
+    assert_eq!(i.kind, FileKind::Directory);
+    assert_eq!(i.times, [1700000000; 3]);
+    assert_eq!(i.size, 0);
+    assert_eq!(i.allocated, 0);
+    assert_eq!(i.extent_count, 0);
+    assert!(b[320..].iter().all(|&b| b == 0));
+}
+#[test]
+fn checksum_valid_bad_fields_and_arbitrary_slices_are_rejected_safely() {
+    let golden = include_bytes!("golden/root-table.bin");
+    for (offset, value) in [(10, 2), (12, 1), (14, 1), (48, 1), (4095, 1)] {
+        let mut b = *golden;
+        b[offset] = value;
+        b[40..44].fill(0);
+        let c = crc32c::crc32c(&b);
+        b[40..44].copy_from_slice(&c.to_le_bytes());
+        assert!(decode_block(&b, 516).is_err());
+    }
+    for offset in [16, 17, 18, 19, 92, 192] {
+        let mut b: [u8; 256] = golden[64..320].try_into().unwrap();
+        b[offset] = 255;
+        assert!(Inode::decode(&b, 0).is_err());
+    }
+    let mut seed = 7u64;
+    for len in 0..=BLOCK + 1 {
+        let mut b = vec![0; len];
+        for value in &mut b {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *value = (seed >> 32) as u8;
+        }
+        let _ = decode_block(&b, 0);
+        let _ = Inode::decode(&b, 0);
+        let _ = decode_directory(&b, 0, ROOT);
+        let _ = decode_extents(&b, 0, ROOT);
+        let _ = JournalControl::decode(&b, 1);
+        let _ = Superblock::decode(&b, 0, u64::MAX);
+    }
+}

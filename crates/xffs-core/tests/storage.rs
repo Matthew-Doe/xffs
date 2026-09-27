@@ -8,6 +8,7 @@ use xffs_core::{
 
 #[test]
 fn image_contract_and_host_flush_reopen() {
+    let _guard = PROCESS_LOCK_TEST.lock().unwrap();
     let image = TempImage::new(32);
     {
         let mut device = ImageDevice::open(&image.0, ReadWrite).unwrap();

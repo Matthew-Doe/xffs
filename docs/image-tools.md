@@ -33,3 +33,9 @@ Full images are Git-ignored. Tests compare generated files byte for byte.
 
 Cargo/rustc reject a dot in a binary target name. The Cargo target is therefore
 `mkfs-xffs`; `scripts/mkfs.xffs` supplies the conventional dotted command name.
+
+The inspector includes bitmap allocation counts and journal image headers and
+directory records. Its accumulated report is bounded to approximately 8 MiB
+(one final bounded record may cross the threshold); larger inspections return a
+resource-limit error. This prevents image contents from demanding unbounded
+report allocation.

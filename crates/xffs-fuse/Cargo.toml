@@ -1,0 +1,23 @@
+[package]
+name = "xffs-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xffs-core = { path = "../xffs-core" }
+fuser = { version = "=0.17.0", default-features = false }
+clap = { version = "=4.5.48", features = ["derive"] }
+libc = "0.2"
+nix = { version = "0.30", features = ["user"] }
+
+[[bin]]
+name = "mount-xffs"
+path = "src/main.rs"
+
+[dev-dependencies]
+xffs-tools = { path = "../xffs-tools" }

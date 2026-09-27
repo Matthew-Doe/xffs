@@ -67,8 +67,12 @@ impl Builder {
     }
     fn mapping(&mut self, id: InodeId, size: u64, extents: Vec<Extent>) -> Result<()> {
         let mut next = 0;
-        for chunk in extents.get(4..).unwrap_or(&[]).rchunks(EXTENTS_PER_BLOCK) {
-            // Fixtures need at most one overflow block; generic codec handles longer chains.
+        for chunk in extents
+            .get(4..)
+            .unwrap_or(&[])
+            .chunks(EXTENTS_PER_BLOCK)
+            .rev()
+        {
             let block = self.next;
             next = self.alloc(encode_extents(block, id, next, chunk)?)?;
         }
@@ -206,6 +210,7 @@ pub fn create_image(
             nested,
             vec![entry("empty-dir", empty), entry("binary.bin", bin)],
         )?;
+        let marker = b.file(ROOT, b"Journal recovery is visible.\n", false)?;
         b.directory(
             ROOT,
             vec![
@@ -217,22 +222,11 @@ pub fn create_image(
                 entry("sparse.bin", sparse),
                 entry("empty.txt", empty_file),
                 entry("many", many),
-                entry("Recovered.txt", b.file_placeholder()),
+                entry("Recovered.txt", marker),
             ],
         )?;
-        // The final entry gets its own inode (no hard links).
-        let marker = b.file(ROOT, b"Journal recovery is visible.\n", false)?;
         let rootblock = b.inodes[0].inline[0].physical;
-        let records = decode_directory(&b.blocks[&rootblock], rootblock, ROOT)?;
-        let mut p = Vec::new();
-        for mut r in records {
-            if r.name == "Recovered.txt" {
-                r.child = marker;
-            }
-            p.extend(r.encode()?);
-        }
-        let final_dir = encode_block(Kind::Directory, rootblock, ROOT, &p)?;
-        b.blocks.insert(rootblock, final_dir);
+        let final_dir = b.blocks[&rootblock];
         if scenario != Scenario::Clean {
             let final_table = b.table(0)?;
             let records = decode_directory(&final_dir, rootblock, ROOT)?;
@@ -261,11 +255,7 @@ pub fn create_image(
     };
     let primary = sb.encode(0)?;
     let backup = sb.encode(layout.blocks - 1)?;
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let result = (|| -> ToolResult<()> {
-        file.try_lock()?;
-        file.set_len(bytes)?;
-        let mut file = file;
+    create_new_image(path, bytes, |file| {
         let mut write = |block: u64, bytes: &Block| -> std::io::Result<()> {
             file.seek(SeekFrom::Start(block * 4096))?;
             file.write_all(bytes)
@@ -315,21 +305,35 @@ pub fn create_image(
         for (n, block) in &b.blocks {
             write(*n, block)?;
         }
+        Ok(())
+    })
+}
+
+fn create_new_image(
+    path: &Path,
+    bytes: u64,
+    write: impl FnOnce(&mut std::fs::File) -> ToolResult<()>,
+) -> ToolResult<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = (|| {
+        file.try_lock()?;
+        file.set_len(bytes)?;
+        write(&mut file)?;
         file.sync_all()?;
         Ok(())
     })();
+    drop(file);
     if result.is_err() {
         std::fs::remove_file(path)?;
     }
     result
 }
-impl Builder {
-    fn file_placeholder(&self) -> InodeId {
-        InodeId {
-            index: self.inodes.len() as u64,
-            generation: 1,
-        }
+
+fn inspection_budget(out: &str) -> ToolResult<()> {
+    if out.len() > 8 * 1024 * 1024 {
+        return Err(FsError::ResourceLimit.into());
     }
+    Ok(())
 }
 
 /// Forensic HOME view, explicitly not recovery or mount validation.
@@ -359,6 +363,17 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
         ));
     }
     let s = sb.ok_or("no valid superblock")?;
+    for n in 515..s.layout.table_start {
+        inspection_budget(&out)?;
+        let mut b = [0; BLOCK];
+        d.read_at(n * 4096, &mut b)?;
+        let h = decode_block(&b, n)?;
+        if h.kind != Kind::Bitmap || h.used != PAYLOAD {
+            return Err("bad bitmap".into());
+        }
+        let allocated: u32 = b[64..].iter().map(|b| b.count_ones()).sum();
+        out.push_str(&format!("HOME bitmap {n}: {allocated} set bits\n"));
+    }
     for n in 0..s.layout.table_blocks {
         let physical = s.layout.table_start + n;
         let mut b = [0; BLOCK];
@@ -368,6 +383,7 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
             return Err("bad inode table".into());
         }
         for slot in 0..15 {
+            inspection_budget(&out)?;
             let index = n * 15 + slot;
             if index >= s.layout.inodes {
                 break;
@@ -386,6 +402,7 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
                 if i.kind == FileKind::Directory {
                     for e in extents {
                         for block in e.physical..e.physical + e.length {
+                            inspection_budget(&out)?;
                             let mut b = [0; BLOCK];
                             d.read_at(block * 4096, &mut b)?;
                             out.push_str(&format!(
@@ -399,6 +416,7 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
         }
     }
     for n in 0..256 {
+        inspection_budget(&out)?;
         let mut b = [0; BLOCK];
         d.read_at((3 + 2 * n) * 4096, &mut b)?;
         if b.iter().all(|&x| x == 0) {
@@ -408,6 +426,40 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
             "JOURNAL PAYLOAD descriptor {n}: {:?}\n",
             JournalDescriptor::decode(&b, n as u32)
         ));
+        if let Ok(desc) = JournalDescriptor::decode(&b, n as u32) {
+            d.read_at((4 + 2 * n) * 4096, &mut b)?;
+            let h = decode_block(&b, desc.target);
+            out.push_str(&format!("JOURNAL PAYLOAD image {n}: {h:?}\n"));
+            if let Ok(h) = h
+                && h.kind == Kind::Directory
+            {
+                out.push_str(&format!(
+                    "JOURNAL PAYLOAD directory: {:?}\n",
+                    decode_directory(&b, desc.target, h.owner)?
+                ));
+            }
+        }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn incomplete_creation_is_removed_and_existing_path_is_preserved() {
+        let p = std::env::temp_dir().join(format!("xffs-failure-{}.img", std::process::id()));
+        let result = super::create_new_image(&p, 4096, |file| {
+            use std::io::Write;
+            file.write_all(b"partial")?;
+            Err("injected write failure".into())
+        });
+        assert!(result.is_err());
+        assert!(!p.exists());
+        std::fs::write(&p, b"existing").unwrap();
+        assert!(
+            super::create_new_image(&p, 4096, |_| panic!("must refuse before writing")).is_err()
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"existing");
+        std::fs::remove_file(p).unwrap();
+    }
 }
