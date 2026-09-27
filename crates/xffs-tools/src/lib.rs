@@ -1,0 +1,413 @@
+//! Explicit image creation and deterministic fixtures, not a transaction engine.
+#![forbid(unsafe_code)]
+use std::{
+    collections::BTreeMap,
+    fs::OpenOptions,
+    io::{Seek, SeekFrom, Write},
+    path::Path,
+};
+use xffs_core::{AccessMode, BlockDevice, ImageDevice, format::*};
+pub type ToolResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Scenario {
+    Clean,
+    Committed,
+    PartialCheckpoint,
+}
+pub const DEMO_UUID: [u8; 16] = [
+    0x58, 0x46, 0x46, 0x53, 0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0, 1,
+];
+pub const TIME: u64 = 1_700_000_000;
+struct Builder {
+    layout: VolumeLayout,
+    next: u64,
+    blocks: BTreeMap<u64, Block>,
+    inodes: Vec<Inode>,
+}
+impl Builder {
+    fn new(layout: VolumeLayout) -> Self {
+        Self {
+            next: layout.data_start,
+            layout,
+            blocks: BTreeMap::new(),
+            inodes: Vec::new(),
+        }
+    }
+    fn alloc(&mut self, b: Block) -> Result<u64> {
+        let n = self.next;
+        if !self.layout.allocatable(n) {
+            return Err(FsError::ResourceLimit);
+        }
+        self.blocks.insert(n, b);
+        self.next += 1;
+        Ok(n)
+    }
+    fn inode(&mut self, kind: FileKind, parent: InodeId) -> Result<InodeId> {
+        let id = InodeId {
+            index: self.inodes.len() as u64,
+            generation: 1,
+        };
+        if id.index >= self.layout.inodes {
+            return Err(FsError::ResourceLimit);
+        }
+        self.inodes.push(Inode {
+            id,
+            kind,
+            state: InodeState::Linked,
+            executable: false,
+            size: 0,
+            allocated: 0,
+            parent,
+            times: [TIME; 3],
+            overflow: 0,
+            extent_count: 0,
+            inline: vec![],
+        });
+        Ok(id)
+    }
+    fn mapping(&mut self, id: InodeId, size: u64, extents: Vec<Extent>) -> Result<()> {
+        let mut next = 0;
+        for chunk in extents.get(4..).unwrap_or(&[]).rchunks(EXTENTS_PER_BLOCK) {
+            // Fixtures need at most one overflow block; generic codec handles longer chains.
+            let block = self.next;
+            next = self.alloc(encode_extents(block, id, next, chunk)?)?;
+        }
+        let i = &mut self.inodes[id.index as usize];
+        i.size = size;
+        i.extent_count = extents.len();
+        i.allocated = extents.iter().map(|e| e.length).sum::<u64>()
+            + extents.len().saturating_sub(4).div_ceil(EXTENTS_PER_BLOCK) as u64;
+        i.overflow = next;
+        i.inline = extents.into_iter().take(4).collect();
+        Ok(())
+    }
+    fn file(&mut self, parent: InodeId, data: &[u8], executable: bool) -> Result<InodeId> {
+        let id = self.inode(FileKind::File, parent)?;
+        let mut extents = vec![];
+        for (n, chunk) in data.chunks(BLOCK).enumerate() {
+            let mut b = [0; BLOCK];
+            b[..chunk.len()].copy_from_slice(chunk);
+            let physical = self.alloc(b)?;
+            extents.push(Extent {
+                logical: n as u64,
+                physical,
+                length: 1,
+            });
+        }
+        self.mapping(id, data.len() as u64, extents)?;
+        self.inodes[id.index as usize].executable = executable;
+        Ok(id)
+    }
+    fn directory(&mut self, id: InodeId, entries: Vec<DirectoryRecord>) -> Result<()> {
+        let mut payload = Vec::new();
+        let mut extents = vec![];
+        for entry in entries {
+            let b = entry.encode()?;
+            if payload.len() + b.len() > PAYLOAD {
+                self.dir_block(id, &mut payload, &mut extents)?;
+            }
+            payload.extend(b);
+        }
+        if !payload.is_empty() {
+            self.dir_block(id, &mut payload, &mut extents)?;
+        }
+        self.mapping(id, extents.len() as u64 * 4096, extents)
+    }
+    fn dir_block(
+        &mut self,
+        id: InodeId,
+        payload: &mut Vec<u8>,
+        extents: &mut Vec<Extent>,
+    ) -> Result<()> {
+        let n = self.next;
+        self.alloc(encode_block(Kind::Directory, n, id, payload)?)?;
+        extents.push(Extent {
+            logical: extents.len() as u64,
+            physical: n,
+            length: 1,
+        });
+        payload.clear();
+        Ok(())
+    }
+    fn table(&self, n: u64) -> Result<Block> {
+        let mut p = [0; 3840];
+        for slot in 0..15 {
+            let index = n * 15 + slot;
+            if let Some(i) = self.inodes.get(index as usize) {
+                p[slot as usize * 256..(slot as usize + 1) * 256].copy_from_slice(&i.encode()?);
+            }
+        }
+        encode_block(
+            Kind::Inodes,
+            self.layout.table_start + n,
+            InodeId::default(),
+            &p,
+        )
+    }
+}
+fn entry(name: &str, child: InodeId) -> DirectoryRecord {
+    DirectoryRecord {
+        name: name.into(),
+        child,
+    }
+}
+/// Preflights all geometry/fixture content before create_new. Removes only the
+/// newly created path on failure; existing paths are never truncated or removed.
+pub fn create_image(
+    path: &Path,
+    bytes: u64,
+    uuid: [u8; 16],
+    inodes: Option<u64>,
+    scenario: Option<Scenario>,
+) -> ToolResult<()> {
+    let layout = VolumeLayout::new(bytes, inodes)?;
+    let mut b = Builder::new(layout.clone());
+    b.inode(FileKind::Directory, ROOT)?;
+    let mut journal = Vec::new();
+    if let Some(scenario) = scenario {
+        let nested = b.inode(FileKind::Directory, ROOT)?;
+        let empty = b.inode(FileKind::Directory, nested)?;
+        let text = b.file(ROOT, b"Hello from XFFS!\n", false)?;
+        let unicode = b.file(ROOT, b"Canonical caseless lookup.\n", false)?;
+        let exec = b.file(ROOT, b"#!/bin/sh\nprintf 'XFFS demo\\n'\n", true)?;
+        let binary: Vec<u8> = (0..8192).map(|n| (n % 256) as u8).collect();
+        let bin = b.file(nested, &binary, false)?;
+        let overflow = b.file(ROOT, &vec![0x5a; 5 * BLOCK], false)?;
+        let sparse = b.inode(FileKind::File, ROOT)?;
+        let first = b.alloc([0x11; BLOCK])?;
+        let last = b.alloc([0x77; BLOCK])?;
+        b.mapping(
+            sparse,
+            (1u64 << 32) + 4096,
+            vec![
+                Extent {
+                    logical: 0,
+                    physical: first,
+                    length: 1,
+                },
+                Extent {
+                    logical: 1 << 20,
+                    physical: last,
+                    length: 1,
+                },
+            ],
+        )?;
+        let empty_file = b.file(ROOT, b"", false)?;
+        let many = b.inode(FileKind::Directory, ROOT)?;
+        let mut entries = vec![];
+        for n in 0..160 {
+            entries.push(entry(
+                &format!("entry-{n:03}.txt"),
+                b.file(many, b"", false)?,
+            ));
+        }
+        b.directory(many, entries)?;
+        b.directory(
+            nested,
+            vec![entry("empty-dir", empty), entry("binary.bin", bin)],
+        )?;
+        b.directory(
+            ROOT,
+            vec![
+                entry("nested", nested),
+                entry("ReadMe.txt", text),
+                entry("Café.txt", unicode),
+                entry("run.sh", exec),
+                entry("overflow.bin", overflow),
+                entry("sparse.bin", sparse),
+                entry("empty.txt", empty_file),
+                entry("many", many),
+                entry("Recovered.txt", b.file_placeholder()),
+            ],
+        )?;
+        // The final entry gets its own inode (no hard links).
+        let marker = b.file(ROOT, b"Journal recovery is visible.\n", false)?;
+        let rootblock = b.inodes[0].inline[0].physical;
+        let records = decode_directory(&b.blocks[&rootblock], rootblock, ROOT)?;
+        let mut p = Vec::new();
+        for mut r in records {
+            if r.name == "Recovered.txt" {
+                r.child = marker;
+            }
+            p.extend(r.encode()?);
+        }
+        let final_dir = encode_block(Kind::Directory, rootblock, ROOT, &p)?;
+        b.blocks.insert(rootblock, final_dir);
+        if scenario != Scenario::Clean {
+            let final_table = b.table(0)?;
+            let records = decode_directory(&final_dir, rootblock, ROOT)?;
+            let mut p = Vec::new();
+            for mut r in records {
+                if r.name == "Recovered.txt" {
+                    r.name = "Before.txt".into();
+                }
+                p.extend(r.encode()?);
+            }
+            b.blocks.insert(
+                rootblock,
+                encode_block(Kind::Directory, rootblock, ROOT, &p)?,
+            );
+            b.inodes[0].times = [TIME - 1; 3];
+            journal.push((rootblock, final_dir));
+            journal.push((layout.table_start, final_table));
+            if scenario == Scenario::PartialCheckpoint {
+                b.blocks.insert(rootblock, final_dir);
+            }
+        }
+    }
+    let sb = Superblock {
+        uuid,
+        layout: layout.clone(),
+    };
+    let primary = sb.encode(0)?;
+    let backup = sb.encode(layout.blocks - 1)?;
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let result = (|| -> ToolResult<()> {
+        file.try_lock()?;
+        file.set_len(bytes)?;
+        let mut file = file;
+        let mut write = |block: u64, bytes: &Block| -> std::io::Result<()> {
+            file.seek(SeekFrom::Start(block * 4096))?;
+            file.write_all(bytes)
+        };
+        write(0, &primary)?;
+        write(layout.blocks - 1, &backup)?;
+        let mut checksum = 0;
+        for (n, (target, image)) in journal.iter().enumerate() {
+            let descriptor = JournalDescriptor {
+                target: *target,
+                ordinal: n as u32,
+                image_checksum: crc32c::crc32c(image),
+                sequence: 2,
+            }
+            .encode()?;
+            checksum = crc32c::crc32c_append(checksum, &descriptor);
+            checksum = crc32c::crc32c_append(checksum, image);
+            write(3 + 2 * n as u64, &descriptor)?;
+            write(4 + 2 * n as u64, image)?;
+        }
+        let control = JournalControl {
+            sequence: if journal.is_empty() { 1 } else { 2 },
+            committed: !journal.is_empty(),
+            count: journal.len() as u32,
+            checksum,
+        };
+        for n in [1, 2] {
+            write(n, &control.encode(n)?)?;
+        }
+        for n in 0..layout.bitmap_blocks {
+            let mut p = [0; PAYLOAD];
+            for bit in 0..32256 {
+                let absolute = n * 32256 + bit;
+                if absolute < layout.blocks && (absolute < b.next || absolute == layout.blocks - 1)
+                {
+                    p[bit as usize / 8] |= 1 << (bit % 8);
+                }
+            }
+            write(
+                515 + n,
+                &encode_block(Kind::Bitmap, 515 + n, InodeId::default(), &p)?,
+            )?;
+        }
+        for n in 0..layout.table_blocks {
+            write(layout.table_start + n, &b.table(n)?)?;
+        }
+        for (n, block) in &b.blocks {
+            write(*n, block)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(path)?;
+    }
+    result
+}
+impl Builder {
+    fn file_placeholder(&self) -> InodeId {
+        InodeId {
+            index: self.inodes.len() as u64,
+            generation: 1,
+        }
+    }
+}
+
+/// Forensic HOME view, explicitly not recovery or mount validation.
+pub fn inspect(path: &Path) -> ToolResult<String> {
+    let mut d = ImageDevice::open(path, AccessMode::ReadOnly)?;
+    let bytes = d.capacity_bytes();
+    if bytes / 4096 < 4096 {
+        return Err("image too small".into());
+    }
+    let mut out = String::from("RAW HOME metadata (not the recovered mounted namespace)\n");
+    let mut sb = None;
+    for n in [0, bytes / 4096 - 1] {
+        let mut b = [0; BLOCK];
+        d.read_at(n * 4096, &mut b)?;
+        let s = Superblock::decode(&b, n, bytes);
+        out.push_str(&format!("superblock {n}: {s:?}\n"));
+        if let Ok(s) = s {
+            sb = Some(s);
+        }
+    }
+    for n in [1, 2] {
+        let mut b = [0; BLOCK];
+        d.read_at(n * 4096, &mut b)?;
+        out.push_str(&format!(
+            "HOME control {n}: {:?}\n",
+            JournalControl::decode(&b, n)
+        ));
+    }
+    let s = sb.ok_or("no valid superblock")?;
+    for n in 0..s.layout.table_blocks {
+        let physical = s.layout.table_start + n;
+        let mut b = [0; BLOCK];
+        d.read_at(physical * 4096, &mut b)?;
+        let h = decode_block(&b, physical)?;
+        if h.kind != Kind::Inodes || h.used != 3840 {
+            return Err("bad inode table".into());
+        }
+        for slot in 0..15 {
+            let index = n * 15 + slot;
+            if index >= s.layout.inodes {
+                break;
+            }
+            if let Some(i) = Inode::decode(
+                &b[64 + slot as usize * 256..64 + (slot as usize + 1) * 256],
+                index,
+            )? {
+                out.push_str(&format!("HOME inode: {i:?}\n"));
+                let (extents, chain) = resolve_extents(&i, &s.layout, |block| {
+                    let mut b = [0; BLOCK];
+                    d.read_at(block * 4096, &mut b)?;
+                    Ok(b)
+                })?;
+                out.push_str(&format!("HOME overflow blocks: {chain:?}\n"));
+                if i.kind == FileKind::Directory {
+                    for e in extents {
+                        for block in e.physical..e.physical + e.length {
+                            let mut b = [0; BLOCK];
+                            d.read_at(block * 4096, &mut b)?;
+                            out.push_str(&format!(
+                                "HOME directory block {block}: {:?}\n",
+                                decode_directory(&b, block, i.id)?
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for n in 0..256 {
+        let mut b = [0; BLOCK];
+        d.read_at((3 + 2 * n) * 4096, &mut b)?;
+        if b.iter().all(|&x| x == 0) {
+            continue;
+        }
+        out.push_str(&format!(
+            "JOURNAL PAYLOAD descriptor {n}: {:?}\n",
+            JournalDescriptor::decode(&b, n as u32)
+        ));
+    }
+    Ok(out)
+}
