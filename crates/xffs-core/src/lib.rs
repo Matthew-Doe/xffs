@@ -127,3 +127,6 @@ pub trait BlockDevice {
     fn write_at(&mut self, offset: u64, source: &[u8]) -> Result<(), DeviceError>;
     fn flush(&mut self) -> Result<(), DeviceError>;
 }
+
+pub mod format;
+pub mod names;

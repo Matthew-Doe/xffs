@@ -54,8 +54,13 @@ fn existing_regular_files_only() {
     ));
 }
 
+// A concurrent process spawn can briefly inherit flock descriptors before exec.
+// Serialize the drop assertion with the subprocess test.
+static PROCESS_LOCK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn locks_are_shared_or_exclusive_and_released_on_drop() {
+    let _guard = PROCESS_LOCK_TEST.lock().unwrap();
     let image = TempImage::new(8);
     let first = ImageDevice::open(&image.0, ReadOnly).unwrap();
     let second = ImageDevice::open(&image.0, ReadOnly).unwrap();
@@ -95,6 +100,7 @@ fn lock_child() {
 
 #[test]
 fn contention_from_separate_process() {
+    let _guard = PROCESS_LOCK_TEST.lock().unwrap();
     let image = TempImage::new(8);
     for access in [ReadOnly, ReadWrite] {
         let holder = ImageDevice::open(&image.0, access).unwrap();
