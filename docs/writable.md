@@ -19,3 +19,22 @@ return an I/O-class error until reopening. Successful mutating core calls are
 durable under the storage contract. Application buffering is outside that
 contract. In-place data overwrites are not atomic: interrupted writes can leave
 mixed old and new data while metadata remains recoverable.
+
+Block allocation uses deterministic next-fit search and never reuses storage
+being freed by the same transaction. Adjacent logical/physical mappings coalesce.
+New data blocks and exposed tails are initialized before metadata publication;
+sparse gaps remain unmapped and read as zeros. Each write request is at most 1 MiB
+and progresses in block-sized durable transactions. A short write reports only
+completed transactions, including when a later backend failure faults the writer.
+
+Shrinking publishes the new size and old-size cleanup bound atomically. Cleanup
+releases at most 64 trailing data blocks per transaction, updating mappings,
+overflow chains, and bitmap together. Opening a writer resumes cleanup and
+reclaims detached inodes before returning. Extension zeros the former EOF tail
+before increasing size, so shrink/extend cannot reveal old contents.
+
+The allocation bitmap is retained as an ownership index after full opening
+validation. Mutations stage only affected inodes, mappings, bitmap blocks, and
+metadata images; they do not rescan the volume. Working-memory checks reserve
+space for staging and affected cached nodes before mutation. Indivisible edits
+larger than 256 metadata images return `TooBig` (`E2BIG` at the adapter).

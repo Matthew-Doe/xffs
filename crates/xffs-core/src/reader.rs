@@ -93,6 +93,8 @@ pub struct DirectoryPage {
     pub eof: bool,
 }
 pub struct ReadOnlyFs<D: BlockDevice = ImageDevice> {
+    pub(crate) bitmap: Vec<u8>,
+    pub(crate) allow_detached: bool,
     pub(crate) metadata: Metadata<D>,
     pub(crate) superblock: Superblock,
     pub(crate) nodes: BTreeMap<u64, Node>,
@@ -247,6 +249,7 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
         }
         claim(&mut owned, l.blocks - 1)?;
         let mut nodes = BTreeMap::new();
+        let mut retired = 0;
         for n in 0..l.table_blocks {
             let physical = l.table_start + n;
             let b = metadata.block(physical)?;
@@ -261,6 +264,9 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
                 if index >= l.inodes {
                     require(raw.iter().all(|&x| x == 0), "inode table padding")?;
                     continue;
+                }
+                if raw[16] == 0 && raw[8..16] == u64::MAX.to_le_bytes() {
+                    retired += 1;
                 }
                 if let Some(inode) = Inode::decode_revision(raw, index, superblock.revision)? {
                     budget.charge(1024 + inode.extent_count * 64 + MAX_CHAIN * 8)?;
@@ -409,11 +415,13 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
             blocks: l.blocks,
             free_blocks: l.blocks - used,
             inodes: l.inodes,
-            free_inodes: l.inodes - nodes.len() as u64,
+            free_inodes: l.inodes - nodes.len() as u64 - retired,
             block_size: 4096,
             max_name: 255,
         };
         Ok(Self {
+            bitmap,
+            allow_detached: false,
             metadata,
             superblock,
             nodes,
@@ -450,7 +458,7 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
         if n.inode.id != id {
             return Err(FsError::Stale);
         }
-        if n.inode.state != InodeState::Linked {
+        if n.inode.state != InodeState::Linked && !self.allow_detached {
             return Err(FsError::NotFound);
         }
         Ok(n)

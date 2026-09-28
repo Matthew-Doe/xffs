@@ -191,3 +191,109 @@ fn counter_exhaustion_and_invalid_recovery_do_not_mutate() {
     assert!(ReadWriteFs::from_device(d.clone(), OpenOptions::default()).is_err());
     assert_eq!(d.0.borrow().mutations, 0);
 }
+
+#[test]
+fn sparse_write_zero_fill_overflow_and_cleanup() {
+    let d = Shared::new(&fixture(
+        FormatRevision::Two,
+        Some(xffs_tools::Scenario::Clean),
+    ));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.lookup(ROOT, b"empty.txt").unwrap();
+    let free = fs.statfs().unwrap().free_blocks;
+    fs.write_file(id, 0, b"secret").unwrap();
+    fs.truncate(id, 2).unwrap();
+    fs.truncate(id, 8192).unwrap();
+    assert_eq!(fs.read_file(id, 0, 8).unwrap(), b"se\0\0\0\0\0\0");
+    fs.truncate(id, 1).unwrap();
+    fs.write_file(id, 5, b"x").unwrap();
+    assert_eq!(fs.read_file(id, 0, 6).unwrap(), b"s\0\0\0\0x");
+    for n in 0..10 {
+        fs.write_file(id, (1u64 << 32) + n * 8192, b"sparse")
+            .unwrap();
+    }
+    assert!(fs.getattr(id).unwrap().extent_count > 4);
+    assert_eq!(fs.read_file(id, 1u64 << 32, 8).unwrap(), b"sparse\0\0");
+    assert_eq!(fs.read_file(id, 4096, 32).unwrap(), vec![0; 32]);
+    fs.truncate(id, 0).unwrap();
+    assert_eq!(fs.statfs().unwrap().free_blocks, free);
+    fs.write_file(id, 0, &vec![0x77; 1024 * 1024]).unwrap();
+    fs.truncate(id, 3).unwrap();
+    assert_eq!(fs.getattr(id).unwrap().allocated, 1);
+    drop(fs);
+    d.crash();
+    let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(fs.read_file(id, 0, 16).unwrap(), vec![0x77; 3]);
+    fs.truncate(id, 4096).unwrap();
+    assert_eq!(fs.read_file(id, 3, 4093).unwrap(), vec![0; 4093]);
+}
+
+#[test]
+fn crashes_during_write_and_multitransaction_truncation() {
+    let bytes = fixture(FormatRevision::Two, Some(xffs_tools::Scenario::Clean));
+    for failure in 1..=24 {
+        let d = Shared::new(&bytes);
+        let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+        let id = fs.lookup(ROOT, b"empty.txt").unwrap();
+        d.arm(failure, true);
+        let result = fs.write_file(id, 8192, b"durable");
+        drop(fs);
+        d.crash();
+        let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+        let got = fs.read_file(id, 8192, 7).unwrap();
+        assert!(got.is_empty() || got == b"durable");
+        if result.is_ok() {
+            assert_eq!(got, b"durable");
+        }
+    }
+    let d = Shared::new(&bytes);
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.lookup(ROOT, b"empty.txt").unwrap();
+    fs.write_file(id, 0, &vec![9; 1024 * 1024]).unwrap();
+    drop(fs);
+    d.crash();
+    let large = d.0.borrow().sim.durable_bytes().to_vec();
+    for failure in 1..=100 {
+        let d = Shared::new(&large);
+        let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+        d.arm(failure, true);
+        let result = fs.truncate(id, 1);
+        drop(fs);
+        d.crash();
+        let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+        let i = fs.getattr(id).unwrap();
+        assert!(i.size == 1 || i.size == 1024 * 1024);
+        if result.is_ok() {
+            assert_eq!(i.size, 1);
+        }
+        assert_eq!(i.cleanup_bound, 0);
+        assert_eq!(i.allocated, i.size.div_ceil(4096));
+    }
+}
+
+#[test]
+fn partial_write_and_memory_preflight() {
+    let bytes = fixture(FormatRevision::Two, Some(xffs_tools::Scenario::Clean));
+    let d = Shared::new(&bytes);
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.lookup(ROOT, b"empty.txt").unwrap();
+    // First block transaction uses 21 mutations; failure is in the next one.
+    d.arm(25, false);
+    assert_eq!(fs.write_file(id, 0, &vec![3; 8192]).unwrap(), 4096);
+    assert!(matches!(fs.getattr(id), Err(FsError::Faulted)));
+    drop(fs);
+    d.crash();
+    let mut ro = ReadOnlyFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    assert_eq!(ro.read_file(id, 0, 4096).unwrap(), vec![3; 4096]);
+    let d = Shared::new(&bytes);
+    assert!(matches!(
+        ReadWriteFs::from_device(
+            d.clone(),
+            OpenOptions {
+                memory_limit: 16 * 1024 * 1024
+            }
+        ),
+        Err(FsError::ResourceLimit)
+    ));
+    assert_eq!(d.0.borrow().mutations, 0);
+}
