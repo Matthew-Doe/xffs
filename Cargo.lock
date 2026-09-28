@@ -700,6 +700,7 @@ dependencies = [
  "crc32c",
  "uuid",
  "xffs-core",
+ "xffs-sim",
 ]
 
 [[package]]

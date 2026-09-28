@@ -19,6 +19,14 @@ pub enum FsError {
     NotDirectory,
     IsDirectory,
     Stale,
+    NoSpace,
+    NoInodes,
+    TooBig,
+    Faulted,
+    CounterExhausted,
+    AlreadyExists,
+    NotEmpty,
+    InvalidInput,
 }
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

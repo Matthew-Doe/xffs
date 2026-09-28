@@ -34,7 +34,7 @@ impl Budget {
 }
 // Deliberately no write or flush methods. This is the only backend interface
 // reachable by recovery/validation/operations, including device-spy tests.
-struct ReadDevice<D>(D);
+pub(crate) struct ReadDevice<D>(pub(crate) D);
 impl<D: BlockDevice> ReadDevice<D> {
     fn capacity(&self) -> u64 {
         self.0.capacity_bytes()
@@ -43,7 +43,7 @@ impl<D: BlockDevice> ReadDevice<D> {
         self.0.read_at(offset, out)?;
         Ok(())
     }
-    fn block(&mut self, n: u64) -> Result<Block> {
+    pub(crate) fn block(&mut self, n: u64) -> Result<Block> {
         let offset = n
             .checked_mul(4096)
             .ok_or(FsError::Corrupt("block offset overflow"))?;
@@ -52,13 +52,13 @@ impl<D: BlockDevice> ReadDevice<D> {
         Ok(b)
     }
 }
-struct Metadata<D> {
-    device: ReadDevice<D>,
-    overlay: BTreeMap<u64, Block>,
-    revision: FormatRevision,
+pub(crate) struct Metadata<D> {
+    pub(crate) device: ReadDevice<D>,
+    pub(crate) overlay: BTreeMap<u64, Block>,
+    pub(crate) revision: FormatRevision,
 }
 impl<D: BlockDevice> Metadata<D> {
-    fn block(&mut self, n: u64) -> Result<Block> {
+    pub(crate) fn block(&mut self, n: u64) -> Result<Block> {
         let b = if let Some(b) = self.overlay.get(&n) {
             *b
         } else {
@@ -71,10 +71,11 @@ impl<D: BlockDevice> Metadata<D> {
         Ok(b)
     }
 }
-struct Node {
-    inode: Inode,
-    extents: Vec<Extent>,
-    entries: Vec<DirectoryRecord>,
+#[derive(Clone)]
+pub(crate) struct Node {
+    pub(crate) inode: Inode,
+    pub(crate) extents: Vec<Extent>,
+    pub(crate) entries: Vec<DirectoryRecord>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatFs {
@@ -92,12 +93,12 @@ pub struct DirectoryPage {
     pub eof: bool,
 }
 pub struct ReadOnlyFs<D: BlockDevice = ImageDevice> {
-    metadata: Metadata<D>,
-    superblock: Superblock,
-    nodes: BTreeMap<u64, Node>,
-    stats: StatFs,
+    pub(crate) metadata: Metadata<D>,
+    pub(crate) superblock: Superblock,
+    pub(crate) nodes: BTreeMap<u64, Node>,
+    pub(crate) stats: StatFs,
     diagnostics: Vec<String>,
-    memory_used: usize,
+    pub(crate) memory_used: usize,
 }
 impl ReadOnlyFs<ImageDevice> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -444,7 +445,7 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
         }
         Ok(n.inode.id)
     }
-    fn node(&self, id: InodeId) -> Result<&Node> {
+    pub(crate) fn node(&self, id: InodeId) -> Result<&Node> {
         let n = self.nodes.get(&id.index).ok_or(FsError::NotFound)?;
         if n.inode.id != id {
             return Err(FsError::Stale);

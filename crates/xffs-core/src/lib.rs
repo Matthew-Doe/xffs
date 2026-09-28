@@ -133,3 +133,6 @@ pub mod names;
 
 pub mod reader;
 pub use reader::ReadOnlyFs;
+
+pub mod writer;
+pub use writer::ReadWriteFs;

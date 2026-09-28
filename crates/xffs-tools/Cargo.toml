@@ -17,3 +17,6 @@ crc32c = "=0.6.8"
 [[bin]]
 name = "mkfs-xffs"
 path = "src/bin/mkfs.rs"
+
+[dev-dependencies]
+xffs-sim = { path = "../xffs-sim" }

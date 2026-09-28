@@ -17,6 +17,12 @@ type Result<T> = std::result::Result<T, Errno>;
 const MAX_HANDLES: usize = 65536;
 fn errno(e: FsError) -> Errno {
     match e {
+        FsError::NoSpace | FsError::NoInodes => Errno::ENOSPC,
+        FsError::TooBig => Errno::E2BIG,
+        FsError::Faulted | FsError::CounterExhausted => Errno::EIO,
+        FsError::AlreadyExists => Errno::EEXIST,
+        FsError::NotEmpty => Errno::ENOTEMPTY,
+        FsError::InvalidInput => Errno::EINVAL,
         FsError::NotFound => Errno::ENOENT,
         FsError::NotDirectory => Errno::ENOTDIR,
         FsError::IsDirectory => Errno::EISDIR,
