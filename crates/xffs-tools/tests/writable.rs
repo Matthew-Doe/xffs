@@ -297,3 +297,147 @@ fn partial_write_and_memory_preflight() {
     ));
     assert_eq!(d.0.borrow().mutations, 0);
 }
+
+#[test]
+fn namespace_and_open_unlinked_lifetimes() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let initial = fs.statfs().unwrap();
+    let a = fs.mkdir(ROOT, b"a").unwrap();
+    let b = fs.mkdir(ROOT, b"b").unwrap();
+    let f = fs.create(a, "Café".as_bytes(), false).unwrap();
+    fs.write_file(f, 0, b"original").unwrap();
+    assert!(matches!(
+        fs.create(a, "CAFE\u{301}".as_bytes(), false),
+        Err(FsError::AlreadyExists)
+    ));
+    assert!(matches!(
+        fs.create(a, b"bad:name", false),
+        Err(FsError::InvalidName)
+    ));
+    assert!(matches!(fs.rmdir(ROOT, b"a"), Err(FsError::NotEmpty)));
+    assert!(matches!(
+        fs.rename(ROOT, b"a", a, b"cycle", false),
+        Err(FsError::InvalidInput)
+    ));
+    fs.rename(a, "Café".as_bytes(), b, b"new", false).unwrap();
+    assert_eq!(fs.getattr(f).unwrap().parent, b);
+    fs.rename(b, b"new", b, b"NEW", false).unwrap();
+    let replaced = fs.create(b, b"old", false).unwrap();
+    fs.write_file(replaced, 0, b"replaced").unwrap();
+    fs.open_handle(f).unwrap();
+    fs.open_handle(replaced).unwrap();
+    assert!(matches!(
+        fs.rename(b, b"NEW", b, b"old", true),
+        Err(FsError::AlreadyExists)
+    ));
+    fs.rename(b, b"NEW", b, b"old", false).unwrap();
+    assert_eq!(fs.lookup(b, b"old").unwrap(), f);
+    assert_eq!(fs.read_file(replaced, 0, 20).unwrap(), b"replaced");
+    fs.append(replaced, b"!").unwrap();
+    assert_eq!(fs.read_file(replaced, 0, 20).unwrap(), b"replaced!");
+    fs.close_handle(replaced).unwrap();
+    assert!(fs.getattr(replaced).is_err());
+    let reused = fs.create(b, b"reuse", false).unwrap();
+    assert_eq!(reused.index, replaced.index);
+    assert_eq!(reused.generation, replaced.generation + 1);
+    assert!(matches!(fs.getattr(replaced), Err(FsError::Stale)));
+    fs.unlink(b, b"old").unwrap();
+    fs.write_file(f, 0, b"O").unwrap();
+    assert_eq!(fs.read_file(f, 0, 20).unwrap(), b"Original");
+    fs.close_handle(f).unwrap();
+    fs.unlink(b, b"reuse").unwrap();
+    fs.rmdir(ROOT, b"a").unwrap();
+    fs.rmdir(ROOT, b"b").unwrap();
+    assert_eq!(fs.statfs().unwrap(), initial);
+    drop(fs);
+    d.crash();
+    let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
+    assert!(ro.read_dir(ROOT, 0, 32).unwrap().entries.is_empty());
+}
+
+#[test]
+fn namespace_crashes_are_atomic_and_reclaim_orphans() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let a = fs.mkdir(ROOT, b"a").unwrap();
+    let b = fs.mkdir(ROOT, b"b").unwrap();
+    let f = fs.create(a, b"source", false).unwrap();
+    let g = fs.create(b, b"target", false).unwrap();
+    fs.write_file(f, 0, b"new").unwrap();
+    fs.write_file(g, 0, b"old").unwrap();
+    drop(fs);
+    d.crash();
+    let bytes = d.0.borrow().sim.durable_bytes().to_vec();
+    for failure in 1..=90 {
+        let d = Shared::new(&bytes);
+        let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+        d.arm(failure, true);
+        let result = fs.rename(a, b"source", b, b"target", false);
+        drop(fs);
+        d.crash();
+        let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+        let target = fs.lookup(b, b"target").unwrap();
+        if target == f {
+            assert!(matches!(fs.lookup(a, b"source"), Err(FsError::NotFound)));
+            assert_eq!(fs.read_file(target, 0, 8).unwrap(), b"new");
+            assert!(fs.getattr(g).is_err());
+        } else {
+            assert_eq!(target, g);
+            assert_eq!(fs.lookup(a, b"source").unwrap(), f);
+        }
+        if result.is_ok() {
+            assert_eq!(target, f);
+        }
+    }
+}
+
+#[test]
+fn inode_exhaustion_local_directory_edits_and_full_image() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let mut ids = vec![];
+    for n in 0..255 {
+        ids.push(
+            fs.create(
+                ROOT,
+                format!("{n:03}-{}", "x".repeat(200)).as_bytes(),
+                false,
+            )
+            .unwrap(),
+        );
+        d.0.borrow_mut().sim.clear_trace();
+    }
+    assert!(matches!(
+        fs.create(ROOT, b"full", false),
+        Err(FsError::NoInodes)
+    ));
+    assert_eq!(fs.statfs().unwrap().free_inodes, 0);
+    for n in 0..255 {
+        fs.unlink(ROOT, format!("{n:03}-{}", "x".repeat(200)).as_bytes())
+            .unwrap();
+        d.0.borrow_mut().sim.clear_trace();
+    }
+    let f = fs.create(ROOT, b"full", false).unwrap();
+    let mut offset = 0;
+    loop {
+        d.0.borrow_mut().sim.clear_trace();
+        match fs.write_file(f, offset, &vec![5; 1024 * 1024]) {
+            Ok(n) => {
+                assert!(n > 0);
+                offset += n as u64;
+            }
+            Err(FsError::NoSpace) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(fs.statfs().unwrap().free_blocks, 0);
+    fs.rename(ROOT, b"full", ROOT, b"FULL", false).unwrap();
+    fs.truncate(f, 0).unwrap();
+    fs.unlink(ROOT, b"FULL").unwrap();
+    drop(fs);
+    d.crash();
+    let fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(fs.statfs().unwrap().free_inodes, 255);
+    assert_eq!(fs.statfs().unwrap().free_blocks, 3561);
+}

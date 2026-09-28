@@ -38,3 +38,20 @@ validation. Mutations stage only affected inodes, mappings, bitmap blocks, and
 metadata images; they do not rescan the volume. Working-memory checks reserve
 space for staging and affected cached nodes before mutation. Indivisible edits
 larger than 256 metadata images return `TooBig` (`E2BIG` at the adapter).
+
+Namespace operations validate portable names and canonical-caseless uniqueness.
+Directory insertion reuses a block's available payload; deletion compacts only
+that block and releases trailing empty blocks. Rename publishes both parents,
+the moved inode, and any detached replacement in one journal transaction. It
+supports case-only changes and no-replace, rejects cycles and nonempty directory
+replacement, and never silently converts between file and directory kinds.
+
+Inodes use the lowest available slot and increment its retained generation.
+`open_handle`/`close_handle` retain identities across unlink and replacement.
+Detached ownership is durable before reclamation; final close reclaims storage.
+Cleanup errors after publication are reported without promising rollback.
+Closing handles remains allowed on a faulted writer; reopening finishes cleanup.
+
+For atomic whole-file replacement: create a temporary file in the destination
+directory, write all contents, fsync the file, rename over the destination, then
+fsync the parent directory. Existing open handles retain the previous file.
