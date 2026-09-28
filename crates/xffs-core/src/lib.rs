@@ -1,6 +1,11 @@
 //! Byte-addressed storage. See `docs/storage-contract.md` for durability semantics.
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{DeviceInfo, LinuxBlockDevice};
+
 mod image;
 pub use image::ImageDevice;
 
@@ -30,6 +35,10 @@ pub enum DeviceError {
         capacity: u64,
     },
     ReadOnly,
+    DeviceRemoved,
+    IdentityChanged,
+    UnsafeTopology(String),
+    UnsupportedGeometry,
     LockContention,
     UnsupportedFileType,
     Io {
@@ -63,6 +72,10 @@ impl fmt::Display for DeviceError {
                 f,
                 "range at {offset} of length {length} exceeds capacity {capacity}"
             ),
+            Self::DeviceRemoved => f.write_str("block device was removed"),
+            Self::IdentityChanged => f.write_str("block device identity changed"),
+            Self::UnsafeTopology(reason) => write!(f, "unsafe block-device topology: {reason}"),
+            Self::UnsupportedGeometry => f.write_str("unsupported block-device geometry"),
             Self::ReadOnly => f.write_str("device is read-only"),
             Self::LockContention => f.write_str("device lock is held by another handle"),
             Self::UnsupportedFileType => {

@@ -13,7 +13,7 @@ pub struct ImageDevice {
     access: AccessMode,
 }
 
-fn io_error(
+pub(crate) fn io_error(
     operation: Operation,
     offset: Option<u64>,
     transferred: Option<usize>,
@@ -27,7 +27,7 @@ fn io_error(
     }
 }
 
-fn retry<T>(mut action: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub(crate) fn retry<T>(mut action: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match action() {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -91,7 +91,7 @@ impl ImageDevice {
     }
 }
 
-fn read_exact(
+pub(crate) fn read_exact(
     reader: &mut impl Read,
     offset: u64,
     destination: &mut [u8],
@@ -113,7 +113,11 @@ fn read_exact(
     Ok(())
 }
 
-fn write_exact(writer: &mut impl Write, offset: u64, source: &[u8]) -> Result<(), DeviceError> {
+pub(crate) fn write_exact(
+    writer: &mut impl Write,
+    offset: u64,
+    source: &[u8],
+) -> Result<(), DeviceError> {
     let mut transferred = 0;
     while transferred < source.len() {
         let count = retry(|| writer.write(&source[transferred..]))

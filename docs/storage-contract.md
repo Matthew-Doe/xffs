@@ -186,3 +186,29 @@ persistence, partial faults, failed flushes, invalid plans without mutation,
 resource exhaustion, deterministic traces, and repeated restarts. The runnable
 `crash_demo` asserts all four milestone outcomes. These tests establish the
 scripted device model; they make no claim of exhaustive real-hardware behavior.
+
+## Linux whole-disk backend
+
+`LinuxBlockDevice` is explicit opt-in and rejects partitions and regular files.
+It holds Linux `O_EXCL` plus an exclusive advisory lock even for read-only access.
+It checks mounts, swap, holders and mounted btrfs membership before and after
+claiming the disk. Kernel claims also prevent conflicting kernel users outside
+the caller's mount namespace. Raw writers ignoring advisory locks remain outside
+this contract. Image read-only locks remain shared.
+
+Capacity comes from `SEEK_END` on the retained descriptor, cross-checked against
+sysfs. Safe pinned rustix wrappers query logical and physical sector sizes;
+512-byte and 4096-byte logical sectors are accepted. Buffered, byte-addressed I/O
+preserves unaligned access. Disk sequence and capacity are checked before I/O;
+removal or replacement never causes reopening. Linux sysfs diskseq is required.
+`DeviceRemoved`, `IdentityChanged`, `UnsafeTopology`, and `UnsupportedGeometry`
+are typed errors. Lower-level failures retain their I/O context.
+
+Writable flush uses `File::sync_all`; durability depends on the hardware honoring
+flushes, as in [Linux block-device fsync](https://raw.githubusercontent.com/torvalds/linux/master/block/fops.c).
+A flush error reaches the existing faulted-writer path. Removal can race any
+check and then surface as an I/O error. Drop never promises a flush.
+
+Run disposable loop contract tests explicitly as root:
+`cargo test -p xffs-core --test linux_device -- --ignored`.
+Ordinary workspace tests neither allocate loops nor access physical disks.
