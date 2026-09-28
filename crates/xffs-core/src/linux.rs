@@ -45,7 +45,14 @@ fn number(path: &Path) -> Result<u64, DeviceError> {
 fn optional(path: &Path) -> Result<Option<String>, DeviceError> {
     match fs::read_to_string(path) {
         Ok(s) => Ok(Some(s.trim().to_owned())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Some SCSI sysfs serial attributes exist but return ENXIO when the
+        // transport supplies no serial; the USB ancestor can still have one.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(rustix::io::Errno::NXIO.raw_os_error()) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(metadata_error(e)),
     }
 }

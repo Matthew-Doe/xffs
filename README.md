@@ -107,3 +107,30 @@ is an error even when the on-disk format completed.
 Empty image creation uses the same streaming formatter. Revision 1 image
 fixtures remain available. Images are still created exclusively, and only newly
 created images are removed on creation failure.
+
+Mount a physical device in an isolated mountpoint owned by your user:
+
+```sh
+mkdir -p /tmp/xffs-usb-mount
+sudo target/debug/mount-xffs /dev/disk/by-id/YOUR-USB /tmp/xffs-usb-mount \
+  --device --rw --memory-mib 512
+# In another terminal, edit files, then cleanly unmount:
+fusermount3 -u /tmp/xffs-usb-mount
+```
+
+Omit `--rw` for read-only service; `--noexec` remains available. Root claims the
+device first, drops supplementary groups and UID/GID to the sudo invoking user,
+and only then performs recovery and starts FUSE. Root without an identifiable
+invoking user must supply non-root `--uid UID --gid GID`. The mountpoint must be
+accessible to that user. The device claim lasts until service exits. On removal,
+I/O fails and a writable service faults; reconnect requires a fresh mount.
+`--memory-mib` uses the same checked conversion as xffs-check. Image mounts retain
+their previous ownership and access behavior.
+
+Disposable real device/FUSE verification (explicit, root required):
+`cargo build --workspace --locked` followed by
+`sudo python3 scripts/device-mount-smoke.py`. It creates its own loop images and
+temporary mountpoints, checks both logical sector sizes, ownership and dropped
+privileges, exclusive access, read-only byte preservation, writable operations,
+and clean remounts. Missing prerequisites exit 77, not a pass. Physical removal
+requires the separate hardware trials.

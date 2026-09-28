@@ -375,3 +375,14 @@ fn independent_revision_two_golden_and_malformed_states() {
         assert!(next_inode_id(&raw, 2).is_err());
     }
 }
+
+#[test]
+fn memory_mib_conversion_is_checked() {
+    assert!(xffs_core::reader::OpenOptions::with_memory_mib(usize::MAX).is_err());
+    assert_eq!(
+        xffs_core::reader::OpenOptions::with_memory_mib(128)
+            .unwrap()
+            .memory_limit,
+        128 * 1024 * 1024
+    );
+}

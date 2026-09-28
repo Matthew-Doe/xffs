@@ -12,6 +12,13 @@ pub const MAX_DIR_PAGE: usize = 1024;
 pub struct OpenOptions {
     pub memory_limit: usize,
 }
+impl OpenOptions {
+    pub fn with_memory_mib(mib: usize) -> Result<Self> {
+        Ok(Self {
+            memory_limit: mib.checked_mul(1024 * 1024).ok_or(FsError::ResourceLimit)?,
+        })
+    }
+}
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {

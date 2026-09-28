@@ -12,12 +12,7 @@ fn main() -> xffs_tools::ToolResult<()> {
     let device = xffs_tools::open_target(&a.image, a.device, xffs_core::AccessMode::ReadOnly)?;
     let fs = xffs_core::ReadOnlyFs::from_device(
         device,
-        xffs_core::reader::OpenOptions {
-            memory_limit: a
-                .memory_mib
-                .checked_mul(1024 * 1024)
-                .ok_or("memory limit overflow")?,
-        },
+        xffs_core::reader::OpenOptions::with_memory_mib(a.memory_mib)?,
     )?;
     for message in fs.diagnostics() {
         println!("{message}");
