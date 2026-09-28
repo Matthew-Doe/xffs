@@ -51,6 +51,8 @@ impl Builder {
             return Err(FsError::ResourceLimit);
         }
         self.inodes.push(Inode {
+            cleanup_bound: 0,
+            atime: 0,
             id,
             kind,
             state: InodeState::Linked,
@@ -164,6 +166,16 @@ pub fn create_image(
     inodes: Option<u64>,
     scenario: Option<Scenario>,
 ) -> ToolResult<()> {
+    create_image_revision(path, bytes, uuid, inodes, scenario, FormatRevision::Two)
+}
+pub fn create_image_revision(
+    path: &Path,
+    bytes: u64,
+    uuid: [u8; 16],
+    inodes: Option<u64>,
+    scenario: Option<Scenario>,
+    revision: FormatRevision,
+) -> ToolResult<()> {
     let layout = VolumeLayout::new(bytes, inodes)?;
     let mut b = Builder::new(layout.clone());
     b.inode(FileKind::Directory, ROOT)?;
@@ -250,6 +262,7 @@ pub fn create_image(
         }
     }
     let sb = Superblock {
+        revision,
         uuid,
         layout: layout.clone(),
     };
@@ -264,13 +277,17 @@ pub fn create_image(
         write(layout.blocks - 1, &backup)?;
         let mut checksum = 0;
         for (n, (target, image)) in journal.iter().enumerate() {
-            let descriptor = JournalDescriptor {
-                target: *target,
-                ordinal: n as u32,
-                image_checksum: crc32c::crc32c(image),
-                sequence: 2,
-            }
-            .encode()?;
+            let image = &with_revision(*image, revision);
+            let descriptor = with_revision(
+                JournalDescriptor {
+                    target: *target,
+                    ordinal: n as u32,
+                    image_checksum: crc32c::crc32c(image),
+                    sequence: 2,
+                }
+                .encode()?,
+                revision,
+            );
             checksum = crc32c::crc32c_append(checksum, &descriptor);
             checksum = crc32c::crc32c_append(checksum, image);
             write(3 + 2 * n as u64, &descriptor)?;
@@ -283,7 +300,7 @@ pub fn create_image(
             checksum,
         };
         for n in [1, 2] {
-            write(n, &control.encode(n)?)?;
+            write(n, &with_revision(control.encode(n)?, revision))?;
         }
         for n in 0..layout.bitmap_blocks {
             let mut p = [0; PAYLOAD];
@@ -296,14 +313,34 @@ pub fn create_image(
             }
             write(
                 515 + n,
-                &encode_block(Kind::Bitmap, 515 + n, InodeId::default(), &p)?,
+                &with_revision(
+                    encode_block(Kind::Bitmap, 515 + n, InodeId::default(), &p)?,
+                    revision,
+                ),
             )?;
         }
         for n in 0..layout.table_blocks {
-            write(layout.table_start + n, &b.table(n)?)?;
+            write(
+                layout.table_start + n,
+                &with_revision(b.table(n)?, revision),
+            )?;
         }
         for (n, block) in &b.blocks {
-            write(*n, block)?;
+            let metadata = b.inodes.iter().any(|i| {
+                i.overflow == *n
+                    || (i.kind == FileKind::Directory
+                        && i.inline
+                            .iter()
+                            .any(|e| *n >= e.physical && *n < e.physical + e.length))
+            });
+            write(
+                *n,
+                &if metadata {
+                    with_revision(*block, revision)
+                } else {
+                    *block
+                },
+            )?;
         }
         Ok(())
     })

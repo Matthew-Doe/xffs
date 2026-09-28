@@ -37,6 +37,7 @@ fn geometry_and_unsupported() {
     );
     assert!(VolumeLayout::new(u64::MAX, Some(u64::MAX)).is_err());
     let s = Superblock {
+        revision: FormatRevision::One,
         uuid: [7; 16],
         layout: l,
     };
@@ -188,6 +189,8 @@ fn control_selection_table() {
 fn malformed_chains_are_bounded() {
     let l = VolumeLayout::new(16 * 1024 * 1024, None).unwrap();
     let mut i = Inode {
+        cleanup_bound: 0,
+        atime: 0,
         id: ROOT,
         kind: FileKind::File,
         state: InodeState::Linked,
@@ -237,7 +240,7 @@ fn independently_encoded_root_table() {
 #[test]
 fn checksum_valid_bad_fields_and_arbitrary_slices_are_rejected_safely() {
     let golden = include_bytes!("golden/root-table.bin");
-    for (offset, value) in [(10, 2), (12, 1), (14, 1), (48, 1), (4095, 1)] {
+    for (offset, value) in [(10, 3), (12, 1), (14, 1), (48, 1), (4095, 1)] {
         let mut b = *golden;
         b[offset] = value;
         b[40..44].fill(0);
@@ -264,4 +267,51 @@ fn checksum_valid_bad_fields_and_arbitrary_slices_are_rejected_safely() {
         let _ = JournalControl::decode(&b, 1);
         let _ = Superblock::decode(&b, 0, u64::MAX);
     }
+}
+
+#[test]
+fn revision_two_slots_and_cleanup() {
+    let id = InodeId {
+        index: 7,
+        generation: 41,
+    };
+    let free = free_inode(id).unwrap();
+    let mut golden = [0; 256];
+    golden[0..8].copy_from_slice(&7u64.to_le_bytes());
+    golden[8..16].copy_from_slice(&41u64.to_le_bytes());
+    assert_eq!(free, golden);
+    assert!(Inode::decode(&free, 7).is_err());
+    assert_eq!(next_inode_id(&free, 7).unwrap().unwrap().generation, 42);
+    assert_eq!(
+        next_inode_id(
+            &free_inode(InodeId {
+                generation: u64::MAX,
+                ..id
+            })
+            .unwrap(),
+            7
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(next_inode_id(&[0; 256], 7).unwrap().unwrap().generation, 1);
+    let mut bad = free;
+    bad[200] = 1;
+    assert!(next_inode_id(&bad, 7).is_err());
+    let table = include_bytes!("golden/root-table.bin");
+    let mut i = Inode::decode(&table[64..320], 0).unwrap().unwrap();
+    i.kind = FileKind::File;
+    i.size = 1;
+    i.cleanup_bound = 8192;
+    i.atime = 123;
+    let bytes = i.encode_revision(FormatRevision::Two).unwrap();
+    assert_eq!(&bytes[192..200], &8192u64.to_le_bytes());
+    assert_eq!(&bytes[200..208], &123u64.to_le_bytes());
+    assert!(Inode::decode(&bytes, 0).is_err());
+    assert_eq!(
+        Inode::decode_revision(&bytes, 0, FormatRevision::Two).unwrap(),
+        Some(i.clone())
+    );
+    i.cleanup_bound = 1;
+    assert!(i.encode_revision(FormatRevision::Two).is_err());
 }

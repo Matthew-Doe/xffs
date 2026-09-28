@@ -55,14 +55,20 @@ impl<D: BlockDevice> ReadDevice<D> {
 struct Metadata<D> {
     device: ReadDevice<D>,
     overlay: BTreeMap<u64, Block>,
+    revision: FormatRevision,
 }
 impl<D: BlockDevice> Metadata<D> {
     fn block(&mut self, n: u64) -> Result<Block> {
-        if let Some(b) = self.overlay.get(&n) {
-            Ok(*b)
+        let b = if let Some(b) = self.overlay.get(&n) {
+            *b
         } else {
-            self.device.block(n)
-        }
+            self.device.block(n)?
+        };
+        require(
+            decode_block(&b, n)?.revision == self.revision,
+            "mixed format revisions",
+        )?;
+        Ok(b)
     }
 }
 struct Node {
@@ -145,6 +151,13 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
             _ => return Err(FsError::Corrupt("no valid superblock")),
         };
         let l = &superblock.layout;
+        for n in [1, 2] {
+            if let Ok(b) = device.block(n)
+                && let Ok(h) = decode_block(&b, n)
+            {
+                require(h.revision == superblock.revision, "mixed control revision")?;
+            }
+        }
         let (control, degraded) = select_control(
             device.block(1).and_then(|b| JournalControl::decode(&b, 1)),
             device.block(2).and_then(|b| JournalControl::decode(&b, 2)),
@@ -158,6 +171,11 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
             for ordinal in 0..control.count {
                 let descriptor = device.block(3 + 2 * u64::from(ordinal))?;
                 let desc = JournalDescriptor::decode(&descriptor, ordinal)?;
+                require(
+                    decode_block(&descriptor, 3 + 2 * u64::from(ordinal))?.revision
+                        == superblock.revision,
+                    "mixed descriptor revision",
+                )?;
                 let image = device.block(4 + 2 * u64::from(ordinal))?;
                 require(
                     desc.sequence == control.sequence
@@ -166,7 +184,9 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
                 )?;
                 let h = decode_block(&image, desc.target)?;
                 require(
-                    l.metadata_target(desc.target, h.kind) && !overlay.contains_key(&desc.target),
+                    h.revision == superblock.revision
+                        && l.metadata_target(desc.target, h.kind)
+                        && !overlay.contains_key(&desc.target),
                     "duplicate or forbidden journal target",
                 )?;
                 checksum = crc32c::crc32c_append(checksum, &descriptor);
@@ -180,7 +200,11 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
                 control.count, control.sequence
             ));
         }
-        let mut metadata = Metadata { device, overlay };
+        let mut metadata = Metadata {
+            device,
+            overlay,
+            revision: superblock.revision,
+        };
         let bitbytes = usize::try_from(l.blocks.div_ceil(8)).map_err(|_| FsError::ResourceLimit)?;
         budget.charge(bitbytes.checked_mul(2).ok_or(FsError::ResourceLimit)?)?;
         let mut bitmap = Vec::new();
@@ -237,7 +261,7 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
                     require(raw.iter().all(|&x| x == 0), "inode table padding")?;
                     continue;
                 }
-                if let Some(inode) = Inode::decode(raw, index)? {
+                if let Some(inode) = Inode::decode_revision(raw, index, superblock.revision)? {
                     budget.charge(1024 + inode.extent_count * 64 + MAX_CHAIN * 8)?;
                     let (extents, chain) = resolve_extents(&inode, l, |n| metadata.block(n))?;
                     for n in chain {
@@ -335,6 +359,10 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
                     }
                 }
             }
+            require(
+                node.inode.state == InodeState::Linked || entries.is_empty(),
+                "nonempty detached directory",
+            )?;
             nodes
                 .get_mut(&index)
                 .ok_or(FsError::Corrupt("missing directory"))?
@@ -436,8 +464,12 @@ impl<D: BlockDevice> ReadOnlyFs<D> {
             "inode table payload",
         )?;
         let slot = (id.index % 15) as usize;
-        let current = Inode::decode(&b[64 + slot * 256..64 + (slot + 1) * 256], id.index)?
-            .ok_or(FsError::Stale)?;
+        let current = Inode::decode_revision(
+            &b[64 + slot * 256..64 + (slot + 1) * 256],
+            id.index,
+            self.superblock.revision,
+        )?
+        .ok_or(FsError::Stale)?;
         require(
             current == self.nodes[&id.index].inode,
             "inode changed while mounted",

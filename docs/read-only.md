@@ -20,7 +20,7 @@ reads reread/check the inode table and overflow chain. Lookup and readdir also
 reread/check directory blocks against their validated records. Metadata changes
 or I/O failures are errors; mapped data failures never become holes. This is not
 a guarantee against programs that ignore the shared lock and modify the image.
-Raw data is not checksummed by format 1.0.
+Raw data is not checksummed by experimental format revision 1.
 
 The public API uses `(index,generation)` identities. `lookup` accepts UTF-8 name
 bytes; `getattr` returns the disk inode; `read_dir` accepts a zero-based cookie

@@ -1,4 +1,4 @@
-# XFFS experimental disk format 1.0
+# XFFS experimental format revisions 1 and 2
 
 This is the authoritative format for this prototype. All integers are unsigned
 little endian unless stated otherwise. Blocks are 4096 bytes. No native Rust
@@ -10,7 +10,7 @@ All arithmetic must be checked before use. Trailing incomplete blocks are ignore
 
 User decisions: metadata redo journaling, fixed inode capacity, portable preserved
 names, executable flags, complete recovered-view validation, read-only recovery,
-and rejection of corruption. Engineering defaults fixed by revision 1.0: the
+and rejection of corruption. Engineering defaults fixed by experimental revision 1: the
 encodings below, 512 payload blocks, minimum 16 MiB, one inode per 65536 bytes
 (minimum 256), and a 128 MiB reader working-memory budget. These are experimental,
 not a promise of compatibility with future revisions. Storage durability remains
@@ -25,8 +25,8 @@ inode table, directories, extent blocks, journal controls and descriptors).
 | --- | --- | --- |
 | 0 | 8 | ASCII `XFFSMETA` |
 | 8 | 2 | type: super=1, control=2, descriptor=3, bitmap=4, inodes=5, directory=6, extents=7 |
-| 10 | 2 | major=1 |
-| 12 | 2 | minor=0 |
+| 10 | 2 | experimental revision: 1 or 2 |
+| 12 | 2 | reserved zero |
 | 14 | 2 | reserved |
 | 16 | 8 | physical home block number |
 | 24 | 8 | owner inode index (zero for non-inode metadata) |
@@ -98,7 +98,9 @@ capacity and unused slots are entirely zero. A live slot has these offsets:
 | 88 | 4 | total extent count, at most 65536 |
 | 92 | 4 | reserved |
 | 96 | 96 | four inline 24-byte extents |
-| 192 | 64 | reserved |
+| 192 | 8 | revision 2: truncation cleanup bound (zero when inactive); revision 1: reserved |
+| 200 | 8 | revision 2: explicit access time; revision 1: reserved |
+| 208 | 48 | reserved |
 
 Timestamps have zero nanoseconds and fit signed i64. Parent identities are valid
 allocated directories for linked inodes; root names itself. No hard links. Each
@@ -199,3 +201,23 @@ Interrupted retirement clean seq3/committed seq2 selects clean, because all home
 images were flushed first. Torn clean control plus committed seq2 selects the
 old payload, which remains intact until both clean controls are durable. Torn
 commit plus clean seq1 selects home, because checkpointing has not started.
+
+## Experimental revision 2
+
+Software remains unreleased 0.0.1; revision numbers identify disk encodings, not
+software releases. No stable disk compatibility is promised. All metadata in a
+volume must use the same revision. New images default to revision 2; `xffs-mkfs
+--format-revision 1` creates compatibility fixtures. Revision 1 remains readable
+and is never converted automatically.
+
+Never-used inode slots are entirely zero. Freed revision 2 slots retain their
+index and last nonzero generation; bytes 16–255 are zero. Reuse increments the
+generation. A slot at generation u64::MAX is permanently retired. Padding slots
+outside capacity remain entirely zero.
+
+A nonzero cleanup bound is strictly greater than the regular file's published
+size. Extents may temporarily cover blocks up to ceil(bound/4096) while cleanup
+runs. Access time is explicit, signed-i64-compatible seconds; reads do not update
+it. Detached revision 2 directories must contain no entries but may retain block
+ownership until reclamation completes. Read-only opening validates these states
+without reclaiming or flushing anything.

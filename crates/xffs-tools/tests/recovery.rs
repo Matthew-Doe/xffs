@@ -10,7 +10,7 @@ use xffs_core::{
     format::*,
     reader::{MAX_READ, OpenOptions},
 };
-use xffs_tools::{DEMO_UUID, Scenario, create_image};
+use xffs_tools::{DEMO_UUID, Scenario, create_image_revision};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Spy {
     bytes: Arc<Vec<u8>>,
@@ -48,7 +48,15 @@ fn fixture(s: Scenario) -> Vec<u8> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    create_image(&p, 16 * 1024 * 1024, DEMO_UUID, None, Some(s)).unwrap();
+    create_image_revision(
+        &p,
+        16 * 1024 * 1024,
+        DEMO_UUID,
+        None,
+        Some(s),
+        FormatRevision::One,
+    )
+    .unwrap();
     let b = std::fs::read(&p).unwrap();
     std::fs::remove_file(p).unwrap();
     b

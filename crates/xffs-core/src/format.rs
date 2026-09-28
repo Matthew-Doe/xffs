@@ -72,9 +72,26 @@ fn put64(b: &mut [u8], o: usize, v: u64) {
     b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FormatVersion {
-    pub major: u16,
-    pub minor: u16,
+pub enum FormatRevision {
+    One = 1,
+    Two = 2,
+}
+impl FormatRevision {
+    pub fn decode(value: u16) -> Result<Self> {
+        match value {
+            1 => Ok(Self::One),
+            2 => Ok(Self::Two),
+            _ => Err(FsError::Unsupported),
+        }
+    }
+}
+/// Change a metadata block's experimental revision and refresh its checksum.
+pub fn with_revision(mut b: Block, revision: FormatRevision) -> Block {
+    put16(&mut b, 10, revision as u16);
+    b[40..44].fill(0);
+    let crc = crc32c::crc32c(&b);
+    put32(&mut b, 40, crc);
+    b
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InodeId {
@@ -112,6 +129,7 @@ impl Kind {
 }
 #[derive(Debug)]
 pub struct Header {
+    pub revision: FormatRevision,
     pub kind: Kind,
     pub block: u64,
     pub owner: InodeId,
@@ -124,12 +142,14 @@ pub fn decode_block(b: &[u8], expected: u64) -> Result<Header> {
     copy.copy_from_slice(b);
     copy[40..44].fill(0);
     require(crc32c::crc32c(&copy) == u32at(b, 40)?, "block checksum")?;
-    if u16at(b, 10)? != 1 || u16at(b, 12)? != 0 {
+    let revision = FormatRevision::decode(u16at(b, 10)?)?;
+    if u16at(b, 12)? != 0 {
         return Err(FsError::Unsupported);
     }
     zero(&b[14..16])?;
     zero(&b[48..64])?;
     let h = Header {
+        revision,
         kind: Kind::decode(u16at(b, 8)?)?,
         block: u64at(b, 16)?,
         owner: InodeId {
@@ -207,6 +227,7 @@ impl VolumeLayout {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Superblock {
+    pub revision: FormatRevision,
     pub uuid: [u8; 16],
     pub layout: VolumeLayout,
 }
@@ -226,7 +247,10 @@ impl Superblock {
             put64(&mut p, o, v);
         }
         put32(&mut p, 64, 1);
-        encode_block(Kind::Super, block, InodeId::default(), &p)
+        Ok(with_revision(
+            encode_block(Kind::Super, block, InodeId::default(), &p)?,
+            self.revision,
+        ))
     }
     pub fn decode(b: &[u8], block: u64, bytes: u64) -> Result<Self> {
         let h = decode_block(b, block)?;
@@ -248,6 +272,7 @@ impl Superblock {
         )?;
         require(block == 0 || block == l.blocks - 1, "superblock location")?;
         Ok(Self {
+            revision: h.revision,
             uuid: get(b, 64)?,
             layout: l,
         })
@@ -293,6 +318,8 @@ pub enum InodeState {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inode {
+    pub cleanup_bound: u64,
+    pub atime: u64,
     pub id: InodeId,
     pub kind: FileKind,
     pub state: InodeState,
@@ -307,6 +334,9 @@ pub struct Inode {
 }
 impl Inode {
     pub fn decode(b: &[u8], index: u64) -> Result<Option<Self>> {
+        Self::decode_revision(b, index, FormatRevision::One)
+    }
+    pub fn decode_revision(b: &[u8], index: u64, revision: FormatRevision) -> Result<Option<Self>> {
         require(b.len() == 256, "inode length")?;
         if b.iter().all(|&x| x == 0) {
             return Ok(None);
@@ -316,6 +346,10 @@ impl Inode {
             generation: u64at(b, 8)?,
         };
         require(id.index == index && id.generation != 0, "inode identity")?;
+        if b[16] == 0 && revision == FormatRevision::Two {
+            zero(&b[16..])?;
+            return Ok(None);
+        }
         let kind = match b[16] {
             1 => FileKind::File,
             2 => FileKind::Directory,
@@ -333,7 +367,17 @@ impl Inode {
         )?;
         zero(&b[19..24])?;
         zero(&b[92..96])?;
-        zero(&b[192..])?;
+        if revision == FormatRevision::One {
+            zero(&b[192..])?;
+        }
+        zero(&b[208..])?;
+        let cleanup_bound = u64at(b, 192)?;
+        let atime = u64at(b, 200)?;
+        require(atime <= i64::MAX as u64, "access timestamp")?;
+        require(
+            cleanup_bound == 0 || (kind == FileKind::File && cleanup_bound > u64at(b, 24)?),
+            "cleanup bound",
+        )?;
         let extent_count = u32at(b, 88)? as usize;
         require(extent_count <= MAX_EXTENTS, "extent limit")?;
         let overflow = u64at(b, 80)?;
@@ -350,10 +394,14 @@ impl Inode {
             generation: u64at(b, 48)?,
         };
         require(
-            state == InodeState::Linked || (parent == InodeId::default() && kind == FileKind::File),
+            state == InodeState::Linked
+                || (parent == InodeId::default()
+                    && (kind == FileKind::File || revision == FormatRevision::Two)),
             "detached inode",
         )?;
         Ok(Some(Self {
+            cleanup_bound,
+            atime,
             id,
             kind,
             state,
@@ -368,6 +416,9 @@ impl Inode {
         }))
     }
     pub fn encode(&self) -> Result<[u8; 256]> {
+        self.encode_revision(FormatRevision::One)
+    }
+    pub fn encode_revision(&self, revision: FormatRevision) -> Result<[u8; 256]> {
         require(
             self.inline.len() == self.extent_count.min(4),
             "inline count",
@@ -391,6 +442,8 @@ impl Inode {
             (64, self.times[1]),
             (72, self.times[2]),
             (80, self.overflow),
+            (192, self.cleanup_bound),
+            (200, self.atime),
         ] {
             put64(&mut b, o, v);
         }
@@ -399,7 +452,7 @@ impl Inode {
         for (n, e) in self.inline.iter().enumerate() {
             e.encode(&mut b[96 + n * 24..120 + n * 24]);
         }
-        Self::decode(&b, self.id.index)?;
+        Self::decode_revision(&b, self.id.index, revision)?;
         Ok(b)
     }
 }
@@ -645,7 +698,7 @@ pub fn resolve_extents(
         require(
             e.length > 0
                 && e.logical >= end
-                && logical_end <= inode.size.div_ceil(4096)
+                && logical_end <= inode.size.max(inode.cleanup_bound).div_ceil(4096)
                 && layout.allocatable(e.physical)
                 && physical_end < layout.blocks,
             "invalid extent mapping",
@@ -666,4 +719,21 @@ pub fn resolve_extents(
         )?;
     }
     Ok((extents, chain))
+}
+
+/// A never-used slot is all zero; a freed slot retains its last identity.
+pub fn free_inode(id: InodeId) -> Result<[u8; 256]> {
+    require(id.generation != 0, "free generation")?;
+    let mut b = [0; 256];
+    put64(&mut b, 0, id.index);
+    put64(&mut b, 8, id.generation);
+    Ok(b)
+}
+pub fn next_inode_id(raw: &[u8], index: u64) -> Result<Option<InodeId>> {
+    if Inode::decode_revision(raw, index, FormatRevision::Two)?.is_some() {
+        return Ok(None);
+    }
+    Ok(u64at(raw, 8)?
+        .checked_add(1)
+        .map(|generation| InodeId { index, generation }))
 }
