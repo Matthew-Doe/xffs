@@ -32,6 +32,7 @@ struct Backend {
     fail: Option<usize>,
     mutations: usize,
     tear: bool,
+    tear_at: usize,
 }
 #[derive(Clone)]
 struct Shared(Rc<RefCell<Backend>>);
@@ -48,6 +49,7 @@ impl Shared {
             fail: None,
             mutations: 0,
             tear: false,
+            tear_at: BLOCK / 2,
         })))
     }
     fn arm(&self, n: usize, tear: bool) {
@@ -55,10 +57,23 @@ impl Shared {
         b.fail = Some(n);
         b.mutations = 0;
         b.tear = tear;
+        b.tear_at = BLOCK / 2;
     }
     fn crash(&self) {
         let mut b = self.0.borrow_mut();
-        b.sim.crash_and_restart(&[]).unwrap();
+        let fragments = if b.tear {
+            b.sim
+                .pending_writes()
+                .iter()
+                .map(|w| Fragment {
+                    write_id: w.id,
+                    range: 0..w.payload.len().min(b.tear_at),
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        b.sim.crash_and_restart(&fragments).unwrap();
         b.fail = None;
         b.sim.clear_faults();
         b.sim.clear_trace();
@@ -75,7 +90,7 @@ impl BlockDevice for Shared {
         let mut s = self.0.borrow_mut();
         s.mutations += 1;
         if s.fail == Some(s.mutations) {
-            let n = if s.tear { b.len() / 2 } else { 0 };
+            let n = if s.tear { b.len().min(s.tear_at) } else { 0 };
             s.sim.fail_next_write(n);
         }
         s.sim.write_at(o, b)
@@ -90,7 +105,7 @@ impl BlockDevice for Shared {
                     .iter()
                     .map(|w| Fragment {
                         write_id: w.id,
-                        range: 0..w.payload.len() / 2,
+                        range: 0..w.payload.len().min(s.tear_at),
                     })
                     .collect()
             } else {
@@ -434,10 +449,477 @@ fn inode_exhaustion_local_directory_edits_and_full_image() {
     assert_eq!(fs.statfs().unwrap().free_blocks, 0);
     fs.rename(ROOT, b"full", ROOT, b"FULL", false).unwrap();
     fs.truncate(f, 0).unwrap();
+    fs.write_file(f, 3, b"x").unwrap();
+    assert_eq!(fs.read_file(f, 0, 4).unwrap(), b"\0\0\0x");
+    fs.truncate(f, 4096).unwrap();
+    assert_eq!(fs.read_file(f, 4, 4092).unwrap(), vec![0; 4092]);
     fs.unlink(ROOT, b"FULL").unwrap();
     drop(fs);
     d.crash();
     let fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
     assert_eq!(fs.statfs().unwrap().free_inodes, 255);
     assert_eq!(fs.statfs().unwrap().free_blocks, 3561);
+}
+
+#[test]
+fn retired_slots_and_mixed_revisions() {
+    let mut bytes = fixture(FormatRevision::Two, None);
+    let l = Superblock::decode(&bytes[..BLOCK], 0, bytes.len() as u64)
+        .unwrap()
+        .layout;
+    let start = l.table_start as usize * BLOCK;
+    let mut table: Block = bytes[start..start + BLOCK].try_into().unwrap();
+    table[320..576].copy_from_slice(
+        &free_inode(InodeId {
+            index: 1,
+            generation: u64::MAX - 1,
+        })
+        .unwrap(),
+    );
+    bytes[start..start + BLOCK].copy_from_slice(&with_revision(table, FormatRevision::Two));
+    let d = Shared::new(&bytes);
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"last-generation", false).unwrap();
+    assert_eq!(
+        id,
+        InodeId {
+            index: 1,
+            generation: u64::MAX
+        }
+    );
+    fs.unlink(ROOT, b"last-generation").unwrap();
+    assert_eq!(fs.statfs().unwrap().free_inodes, 254);
+    assert_eq!(fs.create(ROOT, b"next-slot", false).unwrap().index, 2);
+    drop(fs);
+    d.crash();
+    assert_eq!(
+        ReadOnlyFs::from_device(d, OpenOptions::default())
+            .unwrap()
+            .statfs()
+            .free_inodes,
+        253
+    );
+    for n in [0, 1, 2, 515, l.table_start] {
+        let mut bad = fixture(FormatRevision::Two, None);
+        let start = n as usize * BLOCK;
+        let block: Block = bad[start..start + BLOCK].try_into().unwrap();
+        bad[start..start + BLOCK].copy_from_slice(&with_revision(block, FormatRevision::One));
+        let d = Shared::new(&bad);
+        assert!(ReadOnlyFs::from_device(d.clone(), OpenOptions::default()).is_err());
+        assert!(ReadWriteFs::from_device(d.clone(), OpenOptions::default()).is_err());
+        assert_eq!(d.0.borrow().mutations, 0);
+    }
+}
+
+#[test]
+fn every_create_remove_and_final_close_boundary() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"victim", false).unwrap();
+    fs.write_file(id, 0, &vec![9; 8192]).unwrap();
+    fs.mkdir(ROOT, b"directory").unwrap();
+    drop(fs);
+    d.crash();
+    let bytes = d.0.borrow().sim.durable_bytes().to_vec();
+    for action in 0..5 {
+        let perform = |fs: &mut ReadWriteFs<Shared>| -> Result<()> {
+            match action {
+                0 => {
+                    fs.create(ROOT, b"created", false)?;
+                }
+                1 => {
+                    fs.mkdir(ROOT, b"created")?;
+                }
+                2 => fs.unlink(ROOT, b"victim")?,
+                3 => fs.rmdir(ROOT, b"directory")?,
+                4 => fs.close_handle(id)?,
+                _ => unreachable!(),
+            }
+            Ok(())
+        };
+        let prepare = |d: Shared| {
+            let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+            if action == 4 {
+                fs.open_handle(id).unwrap();
+                fs.unlink(ROOT, b"victim").unwrap();
+            }
+            fs
+        };
+        let baseline = Shared::new(&bytes);
+        let mut fs = prepare(baseline.clone());
+        baseline.arm(usize::MAX, false);
+        perform(&mut fs).unwrap();
+        let count = baseline.0.borrow().mutations;
+        assert!(count > 0);
+        for tear in [false, true] {
+            for failure in 1..=count + 1 {
+                let d = Shared::new(&bytes);
+                let mut fs = prepare(d.clone());
+                d.arm(failure, tear);
+                let result = perform(&mut fs);
+                drop(fs);
+                d.crash();
+                let mut ro = ReadOnlyFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                if result.is_ok() {
+                    match action {
+                        0 | 1 => {
+                            assert!(ro.lookup(ROOT, b"created").is_ok());
+                        }
+                        2 | 4 => {
+                            assert!(ro.lookup(ROOT, b"victim").is_err());
+                        }
+                        3 => {
+                            assert!(ro.lookup(ROOT, b"directory").is_err());
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                drop(ro);
+                let mut recovered = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+                if action == 4 {
+                    assert!(recovered.getattr(id).is_err());
+                }
+                if let Ok(created) = recovered.lookup(ROOT, b"created") {
+                    let i = recovered.getattr(created).unwrap();
+                    assert_eq!(
+                        i.kind,
+                        if action == 0 {
+                            FileKind::File
+                        } else {
+                            FileKind::Directory
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn interrupted_opening_reclamation_and_detached_directory_validation() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"orphan", false).unwrap();
+    fs.write_file(id, 0, &vec![7; 80 * BLOCK]).unwrap();
+    fs.open_handle(id).unwrap();
+    fs.unlink(ROOT, b"orphan").unwrap();
+    drop(fs);
+    d.crash();
+    let bytes = d.0.borrow().sim.durable_bytes().to_vec();
+    let baseline = Shared::new(&bytes);
+    baseline.arm(usize::MAX, false);
+    let recovered = ReadWriteFs::from_device(baseline.clone(), OpenOptions::default()).unwrap();
+    let count = baseline.0.borrow().mutations;
+    let free = recovered.statfs().unwrap();
+    for failure in 1..=count + 1 {
+        let d = Shared::new(&bytes);
+        d.arm(failure, true);
+        let _ = ReadWriteFs::from_device(d.clone(), OpenOptions::default());
+        d.crash();
+        let fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+        assert_eq!(fs.statfs().unwrap(), free);
+    }
+    // A detached empty directory may retain mappings, but never namespace entries.
+    let mut bytes = fixture(FormatRevision::Two, None);
+    let l = Superblock::decode(&bytes[..BLOCK], 0, bytes.len() as u64)
+        .unwrap()
+        .layout;
+    let start = l.table_start as usize * BLOCK;
+    let mut table: Block = bytes[start..start + BLOCK].try_into().unwrap();
+    let mut dir = Inode::decode_revision(&table[64..320], 0, FormatRevision::Two)
+        .unwrap()
+        .unwrap();
+    dir.id = InodeId {
+        index: 1,
+        generation: 1,
+    };
+    dir.parent = InodeId::default();
+    dir.state = InodeState::Orphan;
+    dir.size = 4096;
+    dir.allocated = 1;
+    dir.extent_count = 1;
+    dir.inline = vec![Extent {
+        logical: 0,
+        physical: l.data_start,
+        length: 1,
+    }];
+    table[320..576].copy_from_slice(&dir.encode_revision(FormatRevision::Two).unwrap());
+    bytes[start..start + BLOCK].copy_from_slice(&with_revision(table, FormatRevision::Two));
+    let mut bitmap: Block = bytes[515 * BLOCK..516 * BLOCK].try_into().unwrap();
+    bitmap[64 + l.data_start as usize / 8] |= 1 << (l.data_start % 8);
+    bytes[515 * BLOCK..516 * BLOCK].copy_from_slice(&with_revision(bitmap, FormatRevision::Two));
+    let start = l.data_start as usize * BLOCK;
+    let directory = with_revision(
+        encode_block(Kind::Directory, l.data_start, dir.id, &[]).unwrap(),
+        FormatRevision::Two,
+    );
+    bytes[start..start + BLOCK].copy_from_slice(&directory);
+    let d = Shared::new(&bytes);
+    let mut ro = ReadOnlyFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    assert!(ro.getattr(dir.id).is_err());
+    assert_eq!(d.0.borrow().mutations, 0);
+    let recovered = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(recovered.statfs().unwrap().free_blocks, 3561);
+    assert_eq!(recovered.statfs().unwrap().free_inodes, 255);
+    let record = DirectoryRecord {
+        name: "illegal".into(),
+        child: ROOT,
+    }
+    .encode()
+    .unwrap();
+    bytes[start..start + BLOCK].copy_from_slice(&with_revision(
+        encode_block(Kind::Directory, l.data_start, dir.id, &record).unwrap(),
+        FormatRevision::Two,
+    ));
+    let d = Shared::new(&bytes);
+    assert!(ReadWriteFs::from_device(d.clone(), OpenOptions::default()).is_err());
+    assert_eq!(d.0.borrow().mutations, 0);
+}
+
+#[derive(Clone)]
+struct SparseDevice(Rc<RefCell<SparseStorage>>);
+struct SparseStorage {
+    bytes: u64,
+    blocks: std::collections::BTreeMap<u64, Block>,
+    writes: usize,
+}
+impl BlockDevice for SparseDevice {
+    fn capacity_bytes(&self) -> u64 {
+        self.0.borrow().bytes
+    }
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> std::result::Result<(), DeviceError> {
+        xffs_core::validate_range(self.capacity_bytes(), offset, out.len())?;
+        let storage = self.0.borrow();
+        for (n, v) in out.iter_mut().enumerate() {
+            let pos = offset + n as u64;
+            *v = storage
+                .blocks
+                .get(&(pos / 4096))
+                .map_or(0, |b| b[(pos % 4096) as usize]);
+        }
+        Ok(())
+    }
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::result::Result<(), DeviceError> {
+        xffs_core::validate_range(self.capacity_bytes(), offset, bytes.len())?;
+        let mut storage = self.0.borrow_mut();
+        storage.writes += 1;
+        for (n, v) in bytes.iter().enumerate() {
+            let pos = offset + n as u64;
+            storage.blocks.entry(pos / 4096).or_insert([0; BLOCK])[(pos % 4096) as usize] = *v;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> std::result::Result<(), DeviceError> {
+        self.0.borrow_mut().writes += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn oversized_indivisible_mapping_edit_is_rejected_before_io() {
+    // Sparse backing stores only metadata for a valid 512 MiB, 43,000-extent file.
+    // Inserting its first mapping shifts >256 packed overflow blocks, while
+    // appending touches only the tail. The first operation must not mutate data.
+    let layout = VolumeLayout::new(512 * 1024 * 1024, Some(256)).unwrap();
+    let count = 43000usize;
+    let chain_count = (count - 4).div_ceil(EXTENTS_PER_BLOCK);
+    let root_block = layout.data_start;
+    let data_start = root_block + 1;
+    let chain_start = data_start + count as u64;
+    let allocated_end = chain_start + chain_count as u64;
+    let extents: Vec<_> = (0..count)
+        .map(|n| Extent {
+            logical: 2 * (n as u64 + 1),
+            physical: data_start + n as u64,
+            length: 1,
+        })
+        .collect();
+    let mut root = Inode::decode(
+        &include_bytes!("../../xffs-core/tests/golden/root-table.bin")[64..320],
+        0,
+    )
+    .unwrap()
+    .unwrap();
+    root.size = 4096;
+    root.allocated = 1;
+    root.extent_count = 1;
+    root.inline = vec![Extent {
+        logical: 0,
+        physical: root_block,
+        length: 1,
+    }];
+    let mut file = root.clone();
+    file.id = InodeId {
+        index: 1,
+        generation: 1,
+    };
+    file.kind = FileKind::File;
+    file.size = (2 * count as u64 + 1) * 4096;
+    file.allocated = count as u64 + chain_count as u64;
+    file.extent_count = count;
+    file.inline = extents[..4].to_vec();
+    file.overflow = chain_start;
+    let mut blocks = std::collections::BTreeMap::new();
+    let sb = Superblock {
+        revision: FormatRevision::Two,
+        uuid: [0; 16],
+        layout: layout.clone(),
+    };
+    for n in [0, layout.blocks - 1] {
+        blocks.insert(n, sb.encode(n).unwrap());
+    }
+    for n in [1, 2] {
+        blocks.insert(
+            n,
+            with_revision(
+                JournalControl {
+                    sequence: 1,
+                    committed: false,
+                    count: 0,
+                    checksum: 0,
+                }
+                .encode(n)
+                .unwrap(),
+                FormatRevision::Two,
+            ),
+        );
+    }
+    for n in 0..layout.bitmap_blocks {
+        let mut p = [0; PAYLOAD];
+        for bit in 0..PAYLOAD * 8 {
+            let absolute = n * (PAYLOAD * 8) as u64 + bit as u64;
+            if absolute < allocated_end || absolute == layout.blocks - 1 {
+                p[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        blocks.insert(
+            515 + n,
+            with_revision(
+                encode_block(Kind::Bitmap, 515 + n, InodeId::default(), &p).unwrap(),
+                FormatRevision::Two,
+            ),
+        );
+    }
+    for n in 0..layout.table_blocks {
+        let mut p = [0; 3840];
+        if n == 0 {
+            p[..256].copy_from_slice(&root.encode_revision(FormatRevision::Two).unwrap());
+            p[256..512].copy_from_slice(&file.encode_revision(FormatRevision::Two).unwrap());
+        }
+        blocks.insert(
+            layout.table_start + n,
+            with_revision(
+                encode_block(Kind::Inodes, layout.table_start + n, InodeId::default(), &p).unwrap(),
+                FormatRevision::Two,
+            ),
+        );
+    }
+    for (n, chunk) in extents[4..].chunks(EXTENTS_PER_BLOCK).enumerate() {
+        let physical = chain_start + n as u64;
+        let next = if n + 1 == chain_count {
+            0
+        } else {
+            physical + 1
+        };
+        blocks.insert(
+            physical,
+            with_revision(
+                encode_extents(physical, file.id, next, chunk).unwrap(),
+                FormatRevision::Two,
+            ),
+        );
+    }
+    let entry = DirectoryRecord {
+        name: "fragmented".into(),
+        child: file.id,
+    }
+    .encode()
+    .unwrap();
+    blocks.insert(
+        root_block,
+        with_revision(
+            encode_block(Kind::Directory, root_block, ROOT, &entry).unwrap(),
+            FormatRevision::Two,
+        ),
+    );
+    let d = SparseDevice(Rc::new(RefCell::new(SparseStorage {
+        bytes: layout.blocks * 4096,
+        blocks,
+        writes: 0,
+    })));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let before = fs.statfs().unwrap();
+    d.0.borrow_mut().writes = 0;
+    assert!(matches!(
+        fs.write_file(file.id, 0, b"x"),
+        Err(FsError::TooBig)
+    ));
+    assert_eq!(d.0.borrow().writes, 0);
+    assert_eq!(fs.statfs().unwrap(), before);
+    assert_eq!(fs.getattr(file.id).unwrap(), file);
+    assert_eq!(fs.append(file.id, b"x").unwrap(), 1);
+    drop(fs);
+    let mut limited = ReadWriteFs::from_device(
+        d.clone(),
+        OpenOptions {
+            memory_limit: 24 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    d.0.borrow_mut().writes = 0;
+    assert!(matches!(
+        limited.write_file(file.id, 0, b"x"),
+        Err(FsError::ResourceLimit)
+    ));
+    assert_eq!(d.0.borrow().writes, 0);
+    drop(limited);
+    let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(ro.read_file(file.id, file.size, 1).unwrap(), b"x");
+}
+
+#[test]
+fn torn_header_sequence_state_and_checksum_at_every_transaction_phase() {
+    let bytes = fixture(FormatRevision::Two, Some(xffs_tools::Scenario::Clean));
+    for prefix in [1, 10, 40, 64, 72, 76, 80, 88, BLOCK - 1] {
+        for failure in 1..=14 {
+            let d = Shared::new(&bytes);
+            let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+            let id = fs.lookup(ROOT, b"ReadMe.txt").unwrap();
+            d.arm(failure, true);
+            d.0.borrow_mut().tear_at = prefix;
+            let result = fs.set_attributes(id, Some(true), Some(123), None);
+            assert!(result.is_err());
+            assert!(matches!(fs.sync(), Err(FsError::Faulted)));
+            drop(fs);
+            d.crash();
+            let mut ro = ReadOnlyFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+            let i = ro.getattr(id).unwrap();
+            assert_eq!(i.executable, i.atime == 123);
+            drop(ro);
+            let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+            fs.set_attributes(id, Some(false), Some(456), None).unwrap();
+            drop(fs);
+            d.crash();
+            let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
+            assert_eq!(ro.getattr(id).unwrap().atime, 456);
+        }
+    }
+}
+
+#[test]
+fn interrupted_in_place_overwrite_preserves_metadata_but_may_mix_data() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"in-place", false).unwrap();
+    fs.write_file(id, 0, &[1; BLOCK]).unwrap();
+    d.arm(1, true);
+    d.0.borrow_mut().tear_at = 128;
+    assert!(fs.write_file(id, 0, &[2; BLOCK]).is_err());
+    drop(fs);
+    d.crash();
+    let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(ro.getattr(id).unwrap().size, 4096);
+    let bytes = ro.read_file(id, 0, BLOCK).unwrap();
+    assert_eq!(&bytes[..128], &[2; 128]);
+    assert_eq!(&bytes[128..], &[1; BLOCK - 128]);
 }

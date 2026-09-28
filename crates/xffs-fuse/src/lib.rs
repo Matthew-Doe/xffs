@@ -337,7 +337,13 @@ impl<D: BlockDevice> Adapter<D> {
             } else {
                 permissions(i, self.noexec)
             },
-            nlink: if i.kind == FileKind::Directory { 2 } else { 1 },
+            nlink: if i.state != xffs_core::format::InodeState::Linked {
+                0
+            } else if i.kind == FileKind::Directory {
+                2
+            } else {
+                1
+            },
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
@@ -1103,5 +1109,69 @@ mod tests {
                 .contains(&MountOption::RW)
         );
         assert!(timestamp(TimeOrNow::SpecificTime(UNIX_EPOCH - Duration::from_secs(1))).is_err());
+    }
+    struct FailingDevice {
+        image: xffs_core::ImageDevice,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl BlockDevice for FailingDevice {
+        fn capacity_bytes(&self) -> u64 {
+            self.image.capacity_bytes()
+        }
+        fn read_at(&mut self, o: u64, b: &mut [u8]) -> std::result::Result<(), DeviceError> {
+            self.image.read_at(o, b)
+        }
+        fn write_at(&mut self, o: u64, b: &[u8]) -> std::result::Result<(), DeviceError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(DeviceError::InjectedFault {
+                    operation: xffs_core::Operation::Write,
+                    offset: Some(o),
+                    transferred: 0,
+                });
+            }
+            self.image.write_at(o, b)
+        }
+        fn flush(&mut self) -> std::result::Result<(), DeviceError> {
+            self.image.flush()
+        }
+    }
+    #[test]
+    fn backend_failure_propagates_but_release_still_disposes_handles() {
+        let p =
+            std::env::temp_dir().join(format!("xffs-failing-adapter-{}.img", std::process::id()));
+        xffs_tools::create_image(&p, 16 * 1024 * 1024, xffs_tools::DEMO_UUID, None, None).unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let device = FailingDevice {
+            image: xffs_core::ImageDevice::open(&p, xffs_core::AccessMode::ReadWrite).unwrap(),
+            fail: fail.clone(),
+        };
+        let fs = ReadWriteFs::from_device(device, OpenOptions::default()).unwrap();
+        let adapter = Adapter::new_writable(fs, 123, 456, false);
+        adapter
+            .with(|s| {
+                let id =
+                    s.fs.writable()?
+                        .create(xffs_core::format::ROOT, b"file", false)
+                        .map_err(errno)?;
+                let ino = s.number(id)?;
+                let h = s.open(ino, OpenFlags(libc::O_RDWR), FileKind::File)?;
+                fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(s.write(ino, h, 0, b"failed").unwrap_err().code(), libc::EIO);
+                assert_eq!(s.read(ino, h, 0, 10).unwrap_err().code(), libc::EIO);
+                assert_eq!(
+                    s.sync(ino, h, FileKind::File).unwrap_err().code(),
+                    libc::EIO
+                );
+                s.release(ino, h, FileKind::File)?;
+                assert!(s.handles.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        drop(adapter);
+        let mut fs = ReadOnlyFs::open(&p).unwrap();
+        let id = fs.lookup(xffs_core::format::ROOT, b"file").unwrap();
+        assert_eq!(fs.getattr(id).unwrap().size, 0);
+        drop(fs);
+        std::fs::remove_file(p).unwrap();
     }
 }

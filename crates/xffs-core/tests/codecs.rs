@@ -315,3 +315,63 @@ fn revision_two_slots_and_cleanup() {
     i.cleanup_bound = 1;
     assert!(i.encode_revision(FormatRevision::Two).is_err());
 }
+
+#[test]
+fn independent_revision_two_golden_and_malformed_states() {
+    let table = include_bytes!("golden/revision-two-table.bin");
+    let header = decode_block(table, 516).unwrap();
+    assert_eq!(header.revision, FormatRevision::Two);
+    let root = Inode::decode_revision(&table[64..320], 0, header.revision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.id, ROOT);
+    let i = Inode::decode_revision(&table[320..576], 1, header.revision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            i.id.generation,
+            i.size,
+            i.allocated,
+            i.cleanup_bound,
+            i.atime
+        ),
+        (9, 1, 2, 8192, 123)
+    );
+    assert_eq!(i.times, [1700000000, 1700000001, 1700000002]);
+    assert_eq!(
+        i.encode_revision(FormatRevision::Two).unwrap(),
+        table[320..576]
+    );
+    assert_eq!(next_inode_id(&table[576..832], 2).unwrap(), None);
+    let mut payload = [0; 3840];
+    payload[..256].copy_from_slice(&root.encode_revision(FormatRevision::Two).unwrap());
+    payload[256..512].copy_from_slice(&i.encode_revision(FormatRevision::Two).unwrap());
+    payload[512..768].copy_from_slice(
+        &free_inode(InodeId {
+            index: 2,
+            generation: u64::MAX,
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        &with_revision(
+            encode_block(Kind::Inodes, 516, InodeId::default(), &payload).unwrap(),
+            FormatRevision::Two
+        ),
+        table
+    );
+    for (offset, value) in [(192, 1), (207, 255), (208, 1), (255, 1)] {
+        let mut raw = i.encode_revision(FormatRevision::Two).unwrap();
+        if offset == 192 {
+            raw[192..200].fill(0);
+        }
+        raw[offset] = value;
+        assert!(Inode::decode_revision(&raw, 1, FormatRevision::Two).is_err());
+    }
+    for offset in [16, 17, 18, 24, 192, 200, 255] {
+        let mut raw: [u8; 256] = table[576..832].try_into().unwrap();
+        raw[offset] = 255;
+        assert!(next_inode_id(&raw, 2).is_err());
+    }
+}

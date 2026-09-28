@@ -77,7 +77,9 @@ Bits beyond B are zero. Every set allocatable bit must have exactly one owner;
 every referenced block must be set. No unexplained allocation is accepted.
 
 Inode-table payload is always 3840 bytes: 15 slots of 256 bytes. Slots outside
-capacity and unused slots are entirely zero. A live slot has these offsets:
+capacity and never-used slots are entirely zero. Revision 1 free slots are also
+zero; revision 2 freed slots retain identity as specified below. A live slot has
+these offsets:
 
 | Offset | Bytes | Meaning |
 | --- | --- | --- |
@@ -105,9 +107,10 @@ capacity and unused slots are entirely zero. A live slot has these offsets:
 Timestamps have zero nanoseconds and fit signed i64. Parent identities are valid
 allocated directories for linked inodes; root names itself. No hard links. Each
 non-root linked inode has exactly one directory entry. Orphan/pending inodes
-have parent (0,0), are regular files, have no namespace references, but retain
-ordinary complete mappings and ownership. Pending state reserves storage for a
-future reclamation engine; partial reclamation must update mappings/accounting
+have parent (0,0), have no namespace references, and retain
+ordinary complete mappings and ownership. Revision 1 detached inodes must be
+regular files; revision 2 additionally permits empty directories. Partial
+reclamation must update mappings/accounting
 atomically. Neither state is exposed or reclaimed by the reader.
 
 An extent is logical start block u64, physical start block u64, length u64 > 0.
@@ -187,7 +190,7 @@ targets are forbidden. Type, physical home identity, owner and contextual
 ownership must agree with the recovered view. All ordinary metadata, including
 bitmap/table, is read through the bounded (256-block) overlay.
 
-Writer ordering required by the storage contract (future engine): durably write
+Writer ordering required by the storage contract: durably write
 payload before publishing committed controls; do not checkpoint until both
 committed controls are durable; durably checkpoint all home images before
 publishing clean controls; do not reuse payload until both clean controls are
@@ -206,7 +209,7 @@ commit plus clean seq1 selects home, because checkpointing has not started.
 
 Software remains unreleased 0.0.1; revision numbers identify disk encodings, not
 software releases. No stable disk compatibility is promised. All metadata in a
-volume must use the same revision. New images default to revision 2; `xffs-mkfs
+volume must use the same revision. New images default to revision 2; `mkfs-xffs
 --format-revision 1` creates compatibility fixtures. Revision 1 remains readable
 and is never converted automatically.
 

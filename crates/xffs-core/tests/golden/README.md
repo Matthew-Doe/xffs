@@ -8,3 +8,12 @@ is zero. The codec tests compare expected fields and flip every byte in turn.
 CRC procedure: type 5, physical block 516, payload 3840; slot zero is root (0,1),
 linked directory, parent (0,1), timestamps 1700000000, size/allocation/count zero.
 All remaining inode slots and padding are zero.
+
+`revision-two-table.bin` is independently packed with Python `struct.pack_into`
+and the same bitwise CRC polynomial (without calling the Rust codecs). Header:
+revision 2, table at block 516, used payload 3840. Slot 0 is the revision 1 root
+above. Slot 1 is linked file (1,9), parent (0,1), size 1, allocated 2, one inline
+extent (logical 0, physical 600, length 2), times 1700000000/1/2, cleanup bound
+8192 and access time 123. Slot 2 is free (2,u64::MAX), permanently retired.
+Every other slot/reserved byte is zero. This is a codec vector, not a complete
+filesystem (the linked file needs a directory entry in a complete image).

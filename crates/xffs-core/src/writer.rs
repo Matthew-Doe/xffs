@@ -346,8 +346,23 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         edit.images.insert(n, with_revision(b, FormatRevision::Two));
         Ok(())
     }
+    fn coalesce(node: &mut Node) {
+        node.extents.sort_by_key(|e| e.logical);
+        let mut extents: Vec<Extent> = Vec::new();
+        for e in std::mem::take(&mut node.extents) {
+            if let Some(last) = extents.last_mut()
+                && last.logical + last.length == e.logical
+                && last.physical + last.length == e.physical
+            {
+                last.length += e.length;
+                continue;
+            }
+            extents.push(e);
+        }
+        node.extents = extents;
+    }
     fn stage_node(&mut self, edit: &mut Edit, mut node: Node) -> Result<()> {
-        if node.inode.kind == FileKind::Directory {
+        if node.inode.kind == FileKind::Directory && node.inode.state == InodeState::Linked {
             while let Some(e) = node.extents.last_mut() {
                 let n = e.physical + e.length - 1;
                 if !decode_directory(&self.image(edit, n)?, n, node.inode.id)?.is_empty() {
@@ -363,18 +378,6 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             }
         }
         node.extents.sort_by_key(|e| e.logical);
-        let mut extents: Vec<Extent> = Vec::new();
-        for e in node.extents {
-            if let Some(last) = extents.last_mut()
-                && last.logical + last.length == e.logical
-                && last.physical + last.length == e.physical
-            {
-                last.length += e.length;
-                continue;
-            }
-            extents.push(e);
-        }
-        node.extents = extents;
         if node.extents.len() > MAX_EXTENTS {
             return Err(FsError::TooBig);
         }
@@ -456,10 +459,6 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             } else {
                 self.view.metadata.block(target)?
             };
-            // Use staged bitmap changes for all bits in the same block.
-            if let Some(staged) = edit.images.get(&target) {
-                b = *staged;
-            }
             let bit = n % (PAYLOAD as u64 * 8);
             if set {
                 b[64 + bit as usize / 8] |= 1 << (bit % 8);
@@ -577,6 +576,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         b[start..start + bytes.len()].copy_from_slice(bytes);
         edit.data.retain(|(p, _)| *p != n);
         edit.data.push((n, b));
+        Self::coalesce(&mut node);
         node.inode.size = node.inode.size.max(offset + bytes.len() as u64);
         node.inode.times[1] = now();
         node.inode.times[2] = now();
@@ -796,6 +796,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             physical: n,
             length: 1,
         });
+        Self::coalesce(node);
         node.inode.size += 4096;
         node.entries.push(record);
         node.inode.times[1] = now();

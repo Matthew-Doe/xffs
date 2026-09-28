@@ -17,7 +17,8 @@ or upper-case spelling), run.sh, nested/binary.bin (bytes 0..255 repeated), an
 empty nested directory, empty.txt, many/ with 160 empty files, overflow.bin (five
 one-block extents filled with 0x5a), and sparse.bin. The sparse file has size
 4294971392 with 0x11 in its first block and 0x77 at offset 4294967296; the rest
-is a hole. Timestamps are fixed at Unix 1700000000, UUID is fixed, and allocation
+is a hole. Creation/modification/change timestamps are fixed at Unix 1700000000
+and explicit revision 2 access times start at zero. UUID is fixed, and allocation
 order is deterministic. These are synthetic fixtures, not an importer or a
 transaction engine.
 
@@ -39,3 +40,9 @@ directory records. Its accumulated report is bounded to approximately 8 MiB
 (one final bounded record may cross the threshold); larger inspections return a
 resource-limit error. This prevents image contents from demanding unbounded
 report allocation.
+
+New images default to experimental format revision 2. Both `mkfs-xffs` and
+`xffs-image create-demo` accept `--format-revision 1|2`; use revision 1 for
+compatibility fixtures. No creator changes an existing image or migrates its
+encoding. The inspector decodes free slots, access times and cleanup bounds
+according to each image's revision. Software versions remain unreleased 0.0.1.

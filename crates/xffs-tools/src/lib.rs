@@ -425,9 +425,10 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
             if index >= s.layout.inodes {
                 break;
             }
-            if let Some(i) = Inode::decode(
+            if let Some(i) = Inode::decode_revision(
                 &b[64 + slot as usize * 256..64 + (slot as usize + 1) * 256],
                 index,
+                s.revision,
             )? {
                 out.push_str(&format!("HOME inode: {i:?}\n"));
                 let (extents, chain) = resolve_extents(&i, &s.layout, |block| {
