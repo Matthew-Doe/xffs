@@ -55,3 +55,27 @@ Closing handles remains allowed on a faulted writer; reopening finishes cleanup.
 For atomic whole-file replacement: create a temporary file in the destination
 directory, write all contents, fsync the file, rename over the destination, then
 fsync the parent directory. Existing open handles retain the previous file.
+
+## Mounting
+
+Build with `cargo build --workspace`, create a revision 2 image with
+`target/debug/mkfs-xffs disk.img --size-mib 64 --uuid <UUID>`, then run
+`target/debug/mount-xffs disk.img mountpoint --rw`. The process stays in the
+foreground. Unmount with `fusermount3 -u mountpoint`, and validate with
+`target/debug/xffs-check disk.img`. Omitting `--rw` preserves read-only behavior.
+Image files are the only supported backing storage; physical devices are deferred.
+
+Writable mounts use mounting-user ownership, directories/executable files 0755,
+and ordinary files 0644. Chmod can change execute bits only; any nonempty execute
+bit combination becomes 0755. Other permission changes and nontrivial chown are
+rejected. Explicit access/modification timestamps use whole seconds; reads do not
+update access time. `--noexec` prevents execution. `nosuid`, `nodev`, and kernel
+permission checks remain enabled.
+
+All adapter operations serialize. Append selects EOF while holding that same
+lock. Handles record access flags and generation-bearing identities. FUSE node
+numbers are never recycled during a mount, even when disk slots are reused.
+Writable file opens use direct I/O and writeback caching stays disabled; metadata
+TTLs are zero. Directory opens snapshot names, node numbers, and kinds for stable
+cookies through concurrent namespace changes. The adapter limits handles to
+65,536, snapshots to 16 MiB total, and node mappings to 262,144 per mount.
