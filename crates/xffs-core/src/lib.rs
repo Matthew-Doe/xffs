@@ -149,3 +149,18 @@ pub use reader::ReadOnlyFs;
 
 pub mod writer;
 pub use writer::ReadWriteFs;
+
+impl<T: BlockDevice + ?Sized> BlockDevice for Box<T> {
+    fn capacity_bytes(&self) -> u64 {
+        (**self).capacity_bytes()
+    }
+    fn read_at(&mut self, offset: u64, destination: &mut [u8]) -> Result<(), DeviceError> {
+        (**self).read_at(offset, destination)
+    }
+    fn write_at(&mut self, offset: u64, source: &[u8]) -> Result<(), DeviceError> {
+        (**self).write_at(offset, source)
+    }
+    fn flush(&mut self) -> Result<(), DeviceError> {
+        (**self).flush()
+    }
+}

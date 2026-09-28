@@ -79,3 +79,31 @@ See the [format specification](docs/on-disk-format.md),
 Historical design records remain in [design-decisions.md](design-decisions.md),
 [filesystem-design-and-development-plan.md](filesystem-design-and-development-plan.md),
 and [filesystem-spec-pain-points-and-0.0.1.md](filesystem-spec-pain-points-and-0.0.1.md).
+
+### Explicit Linux whole-disk access
+
+Image commands remain the default. Physical devices require `--device`; only
+whole disks with 512-byte or 4096-byte logical sectors are supported. The format
+is still experimental revision 2, software version 0.0.1.
+
+```sh
+sudo target/debug/mkfs-xffs /dev/disk/by-id/YOUR-USB --device --erase \
+  --expect-serial YOUR-SERIAL --uuid 58464653-0000-0001-8000-000000000001 --inodes 65536
+sudo target/debug/xffs-check /dev/disk/by-id/YOUR-USB --device --memory-mib 512
+sudo target/debug/xffs-inspect /dev/disk/by-id/YOUR-USB --device
+```
+
+Formatting uses the detected capacity; `--size-mib` is image-only. Wrong serial,
+unsupported geometry, invalid layout, active mounts, swap or holders are refused
+before writing. Both old superblocks are invalidated and flushed before metadata
+changes. Metadata and conventional MBR/GPT regions are initialized, flushed,
+and only then are new superblocks published and flushed separately. This is not
+secure erasure of all previous contents. Interrupted formatting is reported and
+never rolled back. No physical device is truncated, resized, removed or restored.
+After releasing its claim, mkfs invokes util-linux `blockdev --rereadpt`, checks
+identity again, and verifies that no kernel partitions remain. Refresh failure
+is an error even when the on-disk format completed.
+
+Empty image creation uses the same streaming formatter. Revision 1 image
+fixtures remain available. Images are still created exclusively, and only newly
+created images are removed on creation failure.

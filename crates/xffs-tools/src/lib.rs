@@ -7,6 +7,9 @@ use std::{
     path::Path,
 };
 use xffs_core::{AccessMode, BlockDevice, ImageDevice, format::*};
+mod formatter;
+pub use formatter::format_empty;
+
 pub type ToolResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Scenario {
@@ -177,6 +180,20 @@ pub fn create_image_revision(
     revision: FormatRevision,
 ) -> ToolResult<()> {
     let layout = VolumeLayout::new(bytes, inodes)?;
+    if scenario.is_none() {
+        return create_new_image(path, bytes, |file| {
+            format_empty(
+                &mut formatter::NewImage {
+                    file,
+                    capacity: bytes,
+                },
+                uuid,
+                inodes,
+                revision,
+            )?;
+            Ok(())
+        });
+    }
     let mut b = Builder::new(layout.clone());
     b.inode(FileKind::Directory, ROOT)?;
     let mut journal = Vec::new();
@@ -375,7 +392,10 @@ fn inspection_budget(out: &str) -> ToolResult<()> {
 
 /// Forensic HOME view, explicitly not recovery or mount validation.
 pub fn inspect(path: &Path) -> ToolResult<String> {
-    let mut d = ImageDevice::open(path, AccessMode::ReadOnly)?;
+    inspect_device(ImageDevice::open(path, AccessMode::ReadOnly)?)
+}
+
+pub fn inspect_device(mut d: impl BlockDevice) -> ToolResult<String> {
     let bytes = d.capacity_bytes();
     if bytes / 4096 < 4096 {
         return Err("image too small".into());
@@ -479,6 +499,60 @@ pub fn inspect(path: &Path) -> ToolResult<String> {
         }
     }
     Ok(out)
+}
+
+/// A serial must be present and nonempty; loop devices use the formatter API.
+pub fn validate_serial(info: &xffs_core::DeviceInfo, expected: &str) -> ToolResult<()> {
+    if expected.is_empty() || info.serial.as_deref() != Some(expected) {
+        return Err("expected serial does not match the claimed device; nothing written".into());
+    }
+    Ok(())
+}
+
+/// The formatter claim must have been released. Never restore partition tables.
+pub fn refresh_partition_view(path: &Path, expected: &xffs_core::DeviceInfo) -> ToolResult<()> {
+    use xffs_core::LinuxBlockDevice;
+    let check = LinuxBlockDevice::open(path, AccessMode::ReadOnly)?;
+    if check.info() != expected {
+        return Err("device identity changed before partition refresh".into());
+    }
+    drop(check);
+    let status = std::process::Command::new("blockdev")
+        .arg("--rereadpt")
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(
+            "format finished, but kernel partition refresh failed; do not mount stale partitions"
+                .into(),
+        );
+    }
+    let check = LinuxBlockDevice::open(path, AccessMode::ReadOnly)?;
+    if check.info() != expected {
+        return Err("device identity changed after partition refresh".into());
+    }
+    let sysfs = std::path::PathBuf::from(format!(
+        "/sys/dev/block/{}:{}",
+        expected.major, expected.minor
+    ));
+    for entry in std::fs::read_dir(sysfs)? {
+        if entry?.path().join("partition").exists() {
+            return Err("format finished, but kernel still exposes partitions".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn open_target(
+    path: &Path,
+    device: bool,
+    access: AccessMode,
+) -> ToolResult<Box<dyn BlockDevice + Send>> {
+    if device {
+        Ok(Box::new(xffs_core::LinuxBlockDevice::open(path, access)?))
+    } else {
+        Ok(Box::new(ImageDevice::open(path, access)?))
+    }
 }
 
 #[cfg(test)]

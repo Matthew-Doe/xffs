@@ -2,13 +2,16 @@ use clap::Parser;
 #[derive(Parser)]
 struct Args {
     image: std::path::PathBuf,
+    #[arg(long)]
+    device: bool,
     #[arg(long, default_value_t = 128)]
     memory_mib: usize,
 }
 fn main() -> xffs_tools::ToolResult<()> {
     let a = Args::parse();
-    let fs = xffs_core::ReadOnlyFs::open_with_options(
-        &a.image,
+    let device = xffs_tools::open_target(&a.image, a.device, xffs_core::AccessMode::ReadOnly)?;
+    let fs = xffs_core::ReadOnlyFs::from_device(
+        device,
         xffs_core::reader::OpenOptions {
             memory_limit: a
                 .memory_mib
