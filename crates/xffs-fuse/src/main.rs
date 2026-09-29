@@ -12,6 +12,10 @@ struct Args {
     rw: bool,
     #[arg(long)]
     device: bool,
+    #[arg(long, requires = "device")]
+    expect_serial: Option<String>,
+    #[arg(long, requires = "device")]
+    expect_disk_sequence: Option<u64>,
     #[arg(long, default_value_t = 128)]
     memory_mib: usize,
     #[arg(long, requires_all = ["gid", "device"])]
@@ -65,6 +69,7 @@ fn main() -> Result<()> {
     // Claim as root, then permanently drop privileges BEFORE recovery reads/writes.
     let device: Box<dyn BlockDevice + Send> = if a.device {
         let device = LinuxBlockDevice::open(&a.image, access)?;
+        device.require_identity(a.expect_serial.as_deref(), a.expect_disk_sequence)?;
         eprintln!("Claimed {}: {:?}", a.image.display(), device.info());
         Box::new(device)
     } else {

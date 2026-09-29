@@ -2,8 +2,10 @@
 
 `ReadOnlyFs::open(path)` opens an ImageDevice with ReadOnly access and retains
 its shared lock until drop. `open_with_options` accepts a memory limit;
-`from_device` supports deterministic test backends with the same stable-capacity
-contract. Internally a private facade exposes only capacity/read/block operations.
+`from_device` supports deterministic test backends and explicit Linux physical
+devices under the same stable-capacity contract. Physical devices hold an exclusive
+claim even in read-only mode. `OpenOptions::with_memory_mib` checks conversion
+overflow. Internally a private facade exposes only capacity/read/block operations.
 No reader, checker, read-only recovery or read-only adapter operation calls
 write_at or flush. Writable access is a separate facade; see [writable.md](writable.md).
 

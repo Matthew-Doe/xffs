@@ -1,7 +1,9 @@
 # Writable POC verification
 
-Acceptance was run on Linux on 2026-09-28. It uses temporary image files only;
-physical devices and USB backups are outside the implementation and test scope.
+This verification record covers the temporary-image acceptance run on Linux on
+2026-09-28. Physical-device implementation and pending USB acceptance are tracked
+separately in the [device results](hardware-results/2026-09-28.md). USB backups
+are outside both workflows.
 Software remains unreleased 0.0.1, with experimental disk revisions 1 and 2.
 
 ## Reproducible checks
@@ -68,7 +70,7 @@ or USB throughput measurement, and there is no numerical acceptance threshold.
 
 Successful mutating core operations are durable under the storage contract;
 application buffering is outside that guarantee. No stable format compatibility,
-physical-device access, migration, hard links, symlinks, special files, ACLs,
+migration, hard links, symlinks, special files, ACLs,
 extended attributes, full Unix ownership/modes, or advanced allocation operations
 are claimed. The adapter's direct I/O and serialized transactions favor a simple,
 testable POC over performance optimization.

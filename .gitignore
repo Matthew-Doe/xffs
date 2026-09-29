@@ -1,3 +1,5 @@
 /target/
 *.img
 *.image
+__pycache__/
+/usb-evidence-*/

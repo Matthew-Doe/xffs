@@ -248,6 +248,20 @@ impl LinuxBlockDevice {
     pub fn info(&self) -> &DeviceInfo {
         &self.info
     }
+    /// Bind an externally selected target to this claimed descriptor before use.
+    pub fn require_identity(
+        &self,
+        serial: Option<&str>,
+        disk_sequence: Option<u64>,
+    ) -> Result<(), DeviceError> {
+        if serial.is_some_and(|expected| {
+            expected.is_empty() || self.info.serial.as_deref() != Some(expected)
+        }) || disk_sequence.is_some_and(|expected| expected != self.info.disk_sequence)
+        {
+            return Err(DeviceError::IdentityChanged);
+        }
+        Ok(())
+    }
     pub fn verify_identity(&mut self) -> Result<(), DeviceError> {
         if !self.sysfs.exists() {
             return Err(DeviceError::DeviceRemoved);
@@ -313,6 +327,56 @@ mod tests {
         assert!(matches!(
             LinuxBlockDevice::open("Cargo.toml", AccessMode::ReadOnly),
             Err(DeviceError::UnsupportedFileType)
+        ));
+    }
+    #[test]
+    fn retained_descriptor_detects_disappearance_and_changed_sequence() {
+        let dir = std::env::temp_dir().join(format!("xffs-identity-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let backing = dir.join("backing");
+        let file = File::create_new(&backing).unwrap();
+        file.set_len(4096).unwrap();
+        fs::write(dir.join("diskseq"), "9").unwrap();
+        fs::write(dir.join("size"), "8").unwrap();
+        let mut device = LinuxBlockDevice {
+            file,
+            sysfs: dir.clone(),
+            access: AccessMode::ReadWrite,
+            info: DeviceInfo {
+                capacity: 4096,
+                logical_sector: 512,
+                physical_sector: 512,
+                major: 7,
+                minor: 0,
+                serial: None,
+                usb: false,
+                removable: false,
+                disk_sequence: 9,
+            },
+        };
+        device.verify_identity().unwrap();
+        device.require_identity(None, Some(9)).unwrap();
+        assert!(matches!(
+            device.require_identity(Some("wrong"), None),
+            Err(DeviceError::IdentityChanged)
+        ));
+        assert!(matches!(
+            device.require_identity(None, Some(10)),
+            Err(DeviceError::IdentityChanged)
+        ));
+        fs::write(dir.join("diskseq"), "10").unwrap();
+        assert!(matches!(
+            device.verify_identity(),
+            Err(DeviceError::IdentityChanged)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(
+            device.verify_identity(),
+            Err(DeviceError::DeviceRemoved)
+        ));
+        assert!(matches!(
+            device.write_at(0, b"no"),
+            Err(DeviceError::DeviceRemoved)
         ));
     }
 }

@@ -63,7 +63,9 @@ Build with `cargo build --workspace`, create a revision 2 image with
 `target/debug/mount-xffs disk.img mountpoint --rw`. The process stays in the
 foreground. Unmount with `fusermount3 -u mountpoint`, and validate with
 `target/debug/xffs-check disk.img`. Omitting `--rw` preserves read-only behavior.
-Image files are the only supported backing storage; physical devices are deferred.
+Linux whole disks can be selected explicitly with `--device`; see
+[device mounting and acceptance](usb-acceptance.md). The device claim is retained
+through service lifetime, and root drops privileges before writable recovery.
 
 Writable mounts use mounting-user ownership, directories/executable files 0755,
 and ordinary files 0644. Chmod can change execute bits only; any nonempty execute

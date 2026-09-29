@@ -46,3 +46,12 @@ New images default to experimental format revision 2. Both `mkfs-xffs` and
 compatibility fixtures. No creator changes an existing image or migrates its
 encoding. The inspector decodes free slots, access times and cleanup bounds
 according to each image's revision. Software versions remain unreleased 0.0.1.
+
+## Whole-disk devices
+
+`mkfs-xffs --device --erase --expect-serial SERIAL` formats a claimed physical
+disk using detected capacity and revision 2. It shares the streaming empty-volume
+formatter with image creation. `xffs-check --device` and `xffs-inspect --device`
+retain exclusive read-only claims. Without `--device`, all three remain image-only.
+See [USB acceptance](usb-acceptance.md) for usage, failure ordering and pending
+hardware validation. Device formatting never uses image cleanup/removal behavior.

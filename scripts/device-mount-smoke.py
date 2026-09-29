@@ -98,7 +98,7 @@ def main():
                             assert fields['Gid'].split() == [str(gid)] * 4
                             assert not fields['Groups'].split()
                             conflict = subprocess.run([BIN / 'xffs-check', device, '--device'], capture_output=True, timeout=10)
-                            assert conflict.returncode != 0
+                            assert conflict.returncode != 0 and b'LockContention' in conflict.stderr
                             run([sys.executable, __file__, '--workload', mount, uid, gid, mode], user=uid, group=gid, extra_groups=[])
                         finally:
                             if mounted(mount):

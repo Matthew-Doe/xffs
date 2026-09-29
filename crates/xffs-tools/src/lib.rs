@@ -548,9 +548,24 @@ pub fn open_target(
     device: bool,
     access: AccessMode,
 ) -> ToolResult<Box<dyn BlockDevice + Send>> {
+    open_target_identified(path, device, access, None, None)
+}
+
+pub fn open_target_identified(
+    path: &Path,
+    device: bool,
+    access: AccessMode,
+    serial: Option<&str>,
+    disk_sequence: Option<u64>,
+) -> ToolResult<Box<dyn BlockDevice + Send>> {
     if device {
-        Ok(Box::new(xffs_core::LinuxBlockDevice::open(path, access)?))
+        let device = xffs_core::LinuxBlockDevice::open(path, access)?;
+        device.require_identity(serial, disk_sequence)?;
+        Ok(Box::new(device))
     } else {
+        if serial.is_some() || disk_sequence.is_some() {
+            return Err("identity expectations require --device".into());
+        }
         Ok(Box::new(ImageDevice::open(path, access)?))
     }
 }

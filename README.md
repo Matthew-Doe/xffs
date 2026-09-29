@@ -1,6 +1,6 @@
 # XFFS
 
-Experimental filesystem POC for regular image files, with durable core mutations,
+Experimental filesystem POC for images and Linux whole-disk devices, with durable core mutations,
 metadata redo journaling, writable recovery, and a deterministic crash simulator.
 Linux FUSE mounts are read-only by default; `--rw` enables everyday file and
 directory operations, including editor saves and atomic rename/replacement.
@@ -35,8 +35,8 @@ target/debug/xffs-check disk.img
 # Remount with the same command to verify saved contents.
 ```
 
-Omit `--rw` for a shared-lock read-only mount. Writable mounts hold an exclusive
-image lock. Both modes retain `nosuid,nodev,default_permissions`; `--noexec`
+Omit `--rw` for a read-only mount. Read-only images hold shared locks; writable
+images and all physical-device handles hold exclusive locks. Both modes retain `nosuid,nodev,default_permissions`; `--noexec`
 prevents execution. Writable ownership is the mounting user's; directories and
 executable files use 0755, ordinary files 0644. Chmod changes execute bits only.
 Names preserve spelling and use Unicode 16.0 canonical-caseless matching.
@@ -68,9 +68,10 @@ committed`. Both creators accept `--format-revision 1|2` (default 2).
 Cargo target names are `mount-xffs` and `mkfs-xffs`; `scripts/mount.xffs` and
 `scripts/mkfs.xffs` provide conventional dotted wrappers.
 
-Physical devices, USB access, migration, importers, hard links, symlinks, special
-files, full Unix ownership/modes, ACLs, xattrs, and advanced allocation operations
-remain deferred. Development and acceptance tests operate only on image files.
+Migration, importers, hard links, symlinks, special files, full Unix ownership/modes,
+ACLs, xattrs, and advanced allocation operations remain deferred. Ordinary tests
+use images and simulated devices; privileged loop and USB tests require explicit
+invocation. Actual USB acceptance remains pending as recorded below.
 
 See the [format specification](docs/on-disk-format.md),
 [writable API and mount behavior](docs/writable.md),
@@ -134,3 +135,8 @@ temporary mountpoints, checks both logical sector sizes, ownership and dropped
 privileges, exclusive access, read-only byte preservation, writable operations,
 and clean remounts. Missing prerequisites exit 77, not a pass. Physical removal
 requires the separate hardware trials.
+
+The serial-bound destructive USB harness, manual unplug protocol, and evidence
+format are documented in [USB acceptance](docs/usb-acceptance.md). See the
+[dated verification report](docs/hardware-results/2026-09-28.md) for actual passes
+and pending hardware trials; temporary image results are not USB acceptance.
