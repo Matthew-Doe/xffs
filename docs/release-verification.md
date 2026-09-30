@@ -54,3 +54,37 @@ toolchain. With that directory's `bin` prepended to PATH, formatting, Clippy wit
 warnings denied, all workspace/all-target tests and the crash demonstration all
 passed with `--locked` where applicable, using the commands above. The source
 packager also correctly refused the dirty tracked preparation tree.
+
+## Archive and installation checks
+
+The initial clean source archive used commit
+`9a261a61e68b79bf644aef5057f87c64abad215d`. Its SHA-256 check passed; tar file
+entries exactly matched `git ls-files`, and its pax source commit matched HEAD.
+Cargo.lock, LICENSE, docs, tests and scripts were included; build outputs and
+untracked hardware logs were absent. It was extracted into a fresh temporary
+directory and these commands passed:
+
+```sh
+PATH=/tmp/xffs-rust-1.89/bin:$PATH cargo build --release --workspace --locked
+./scripts/mount-smoke.sh --bin-dir "$PWD/target/release"
+./scripts/writable-smoke.sh --bin-dir "$PWD/target/release"
+```
+
+Both FUSE scripts ran on the host outside the sandbox, without sudo. Read-only
+images remained byte-identical. Writable tests passed the actual nano save,
+remount persistence, locking, handle lifetimes, permissions, revision 1 refusal,
+read-only preservation and clean unmount. The tmpfs release-build sample was
+103.19 MiB/s for a 1 MiB write; this does not replace the USB measurement.
+
+The documented `install -d` / `install -m 755` loop installed all six tools into
+a fresh temporary prefix, where each executable matched its built source.
+Installed mkfs/check successfully created and checked a 16 MiB image. The
+specified removal loop emptied `bin` and preserved that image. No system mount
+helpers were registered.
+
+A subsequent review moved the new device remount-persistence assertion into the
+unprivileged workload process, because FUSE access belongs to the mounting user.
+Python compilation passed after that correction. The final candidate is
+repackaged from the clean record/correction commit; its exact hash and source
+commit are in the archive sidecars. The privileged gate remains pending and no
+historical hardware evidence was modified.

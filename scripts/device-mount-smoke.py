@@ -19,9 +19,11 @@ def run(args, **kwargs):
 def mounted(path):
     return subprocess.run(['mountpoint', '-q', str(path)], timeout=5).returncode == 0
 
-def workload(path, uid, gid, writable):
+def workload(path, uid, gid, writable, verify_persistence=False):
     assert path.stat().st_uid == uid
     assert path.stat().st_gid == gid
+    if verify_persistence:
+        assert (path / 'retained').read_bytes() == b'reconnect persistence'
     if not writable:
         try:
             (path / 'forbidden').write_text('no')
@@ -59,7 +61,7 @@ def workload(path, uid, gid, writable):
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--workload':
-        workload(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == 'rw')
+        workload(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == 'rw', sys.argv[5] == 'verify')
         return 0
     global BIN
     parser = argparse.ArgumentParser(description=__doc__)
@@ -100,8 +102,6 @@ def main():
                                     log.seek(0)
                                     raise RuntimeError(log.read())
                                 time.sleep(.05)
-                            if iteration == 2:
-                                assert (mount / 'retained').read_bytes() == b'reconnect persistence'
                             status = Path(f'/proc/{proc.pid}/status').read_text()
                             fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
                             assert fields['Uid'].split() == [str(uid)] * 4
@@ -109,7 +109,7 @@ def main():
                             assert not fields['Groups'].split()
                             conflict = subprocess.run([BIN / 'xffs-check', device, '--device'], capture_output=True, timeout=10)
                             assert conflict.returncode != 0 and b'LockContention' in conflict.stderr
-                            run([sys.executable, __file__, '--workload', mount, uid, gid, mode], user=uid, group=gid, extra_groups=[])
+                            run([sys.executable, __file__, '--workload', mount, uid, gid, 'verify' if iteration == 2 else mode], user=uid, group=gid, extra_groups=[])
                         finally:
                             try:
                                 if mounted(mount):
