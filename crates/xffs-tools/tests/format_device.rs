@@ -167,3 +167,20 @@ fn loop_format_check_and_writable_reopen() {
         assert_eq!(fs.read_file(id, 0, 16).unwrap(), b"loop persistence");
     }
 }
+
+#[test]
+fn existing_format_verification_requires_matching_redundant_metadata() {
+    let mut d = Memory::new(usize::MAX);
+    format_empty(&mut d, [7; 16], Some(256), FormatRevision::Two).unwrap();
+    let operations = d.operations;
+    xffs_tools::verify_existing_format(&mut d, [7; 16], 256).unwrap();
+    assert!(xffs_tools::verify_existing_format(&mut d, [8; 16], 256).is_err());
+    assert!(xffs_tools::verify_existing_format(&mut d, [7; 16], 512).is_err());
+    let last = d.bytes.len() - 4096;
+    d.bytes[last..].fill(0);
+    assert!(xffs_tools::verify_existing_format(&mut d, [7; 16], 256).is_err());
+    assert_eq!(
+        d.operations, operations,
+        "verification must never write or flush"
+    );
+}

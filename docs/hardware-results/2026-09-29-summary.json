@@ -1,11 +1,26 @@
 {
   "final.json": {
-    "acceptance_complete": false,
+    "acceptance_complete": true,
     "check_passed": true,
     "cleanly_unmounted": true,
-    "pending": [
-      "formatted.json"
-    ]
+    "pending": []
+  },
+  "formatted.json": {
+    "device": {
+      "diskseq": 8,
+      "path": "/dev/sdb",
+      "rm": true,
+      "serial": "0085199340190280",
+      "size": 124623257600,
+      "sysfs": "/sys/class/block/sdb",
+      "tran": "usb",
+      "type": "disk"
+    },
+    "original_format_command_succeeded": false,
+    "passed": true,
+    "time": 1790733645.1070492,
+    "uuid": "67b2fdfe-99c4-4062-98aa-d789adf9c572",
+    "verification": "existing format verified later; partition view refreshed"
   },
   "passed-cleanup.json": {
     "diskseq": 8,

@@ -570,6 +570,35 @@ pub fn open_target_identified(
     }
 }
 
+/// Validate both copies of an existing format without writing or repairing it.
+pub fn verify_existing_format(
+    device: &mut impl BlockDevice,
+    uuid: [u8; 16],
+    inodes: u64,
+) -> ToolResult<()> {
+    let capacity = device.capacity_bytes();
+    if capacity < 4096 {
+        return Err("device too small".into());
+    }
+    let mut copies = Vec::new();
+    for block in [0, capacity / 4096 - 1] {
+        let mut bytes = [0; BLOCK];
+        device.read_at(block * 4096, &mut bytes)?;
+        copies.push(Superblock::decode(&bytes, block, capacity)?);
+    }
+    if copies[0] != copies[1]
+        || copies[0].uuid != uuid
+        || copies[0].revision != FormatRevision::Two
+        || copies[0].layout.inodes != inodes
+    {
+        return Err(
+            "existing format does not match expected UUID, revision, inode count, or redundancy"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

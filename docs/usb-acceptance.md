@@ -192,3 +192,26 @@ validation, writable recovery, acknowledgement checks and final check as the
 original trial. Only then does it mark the trial passed. It does not repeat the
 unplug or reformat. Without an observed-removal record, use `verify`; that alone
 still cannot establish a physical-removal pass.
+
+## Completing a missing format receipt without erasing
+
+If on-disk formatting succeeded but the original post-format reopen or partition
+refresh failed, `finalize-report` verifies the existing disk against the original
+format attempt. It requires matching serial, current disk sequence, capacity,
+UUID, revision 2, 65,536 inodes, two matching valid superblocks and a valid
+recovered filesystem. It then refreshes the kernel partition view, waits for
+udev, checks that no partitions remain, and repeats the same read-only format
+verification. Only after success does it create a missing `formatted.json`,
+explicitly identifying it as later verification rather than claiming that the
+original formatter command succeeded. It then runs the normal `finish` checks.
+
+```sh
+cargo build -p xffs-tools --bin xffs-verify-format --locked
+sudo python3 scripts/usb-acceptance.py \
+  --expect-serial 0085199340190280 --report-dir "$PWD/usb-evidence-2026-09-28-manual" \
+  finalize-report
+```
+
+No mkfs operation is invoked and no file data is erased. Existing evidence is
+preserved. A failed verification or refresh leaves the missing receipt missing;
+do not manually invent a passing receipt or reformat to fix a reporting gap.

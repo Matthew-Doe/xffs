@@ -638,6 +638,32 @@ def worker_main():
         verify(mount, report, kind, cold=mode == 'verify-cold')
 
 
+def finalize_format(h, d):
+    attempt = json.loads((h.report / 'format-started.json').read_text())
+    if attempt['device']['serial'] != SERIAL or attempt['device']['size'] != d['size']:
+        raise RuntimeError('original format identity does not match this device')
+    filesystem_uuid = str(uuid.UUID(attempt['uuid']))
+    command = [BIN / 'xffs-verify-format', d['path'], '--expect-serial', SERIAL,
+               '--expect-disk-sequence', str(d['diskseq']), '--expect-bytes', str(d['size']),
+               '--expect-uuid', filesystem_uuid, '--expect-inodes', '65536']
+    h.command(command, 'verify-existing-format', retry_lock=True)
+    # Refresh only the in-memory kernel partition view; never invoke mkfs.
+    if identify() != d:
+        raise RuntimeError('identity changed before partition refresh')
+    h.command(['blockdev', '--rereadpt', d['path']], 'partition-refresh')
+    h.command(['udevadm', 'settle', '--timeout=15'], 'settle-partitions')
+    if identify() != d:
+        raise RuntimeError('identity changed after partition refresh')
+    if any((p / 'partition').exists() for p in Path(d['sysfs']).iterdir()):
+        raise RuntimeError('kernel still exposes partitions; format receipt not written')
+    h.command(command, 'verify-existing-format', retry_lock=True)
+    receipt = h.report / 'formatted.json'
+    if not receipt.exists():
+        save(receipt, {'passed': True, 'device': d, 'uuid': filesystem_uuid,
+             'verification': 'existing format verified later; partition view refreshed',
+             'original_format_command_succeeded': False, 'time': time.time()})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--expect-serial', required=True, choices=[SERIAL])
@@ -646,7 +672,7 @@ def main():
     sub.add_parser('identify')
     fmt = sub.add_parser('format')
     fmt.add_argument('--erase', action='store_true', required=True)
-    for action in ['workload', 'reconnect', 'verify', 'finish', 'accept', 'recover', 'check', 'resume-workload']:
+    for action in ['workload', 'reconnect', 'verify', 'finish', 'accept', 'recover', 'check', 'resume-workload', 'finalize-report']:
         sub.add_parser(action)
     trial = sub.add_parser('trial')
     trial.add_argument('kind', choices=['create', 'replace', 'cleanup'])
@@ -673,6 +699,9 @@ def main():
         return
     h = Harness(args.report_dir, d)
     record(h.events, {'event': 'start', 'action': args.action, 'device': d})
+    if args.action == 'finalize-report':
+        finalize_format(h, d)
+        args.action = 'finish'
     if args.action == 'format':
         marker = h.report / 'format-started.json'
         if marker.exists():

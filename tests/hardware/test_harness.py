@@ -223,5 +223,52 @@ class ReconnectTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'already passed'):
                 usb.observed_removal(report, 'replace')
 
+class FinalizeTests(unittest.TestCase):
+    def fixture(self, tmp):
+        h = usb.Harness.__new__(usb.Harness)
+        h.report = Path(tmp)
+        h.command = mock.Mock()
+        sysfs = h.report / 'sysfs'
+        sysfs.mkdir()
+        device = {'serial': usb.SERIAL, 'size': 124623257600, 'diskseq': 8,
+                  'path': '/dev/test', 'sysfs': str(sysfs)}
+        usb.save(h.report / 'format-started.json', {'device': device,
+                 'uuid': '67b2fdfe-99c4-4062-98aa-d789adf9c572'})
+        return h, device
+
+    def test_receipt_requires_refresh_and_reverification_without_formatting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h, d = self.fixture(tmp)
+            with mock.patch.object(usb, 'identify', return_value=d):
+                usb.finalize_format(h, d)
+            commands = [call.args[0] for call in h.command.call_args_list]
+            self.assertEqual(commands[0], commands[-1])
+            self.assertEqual(commands[1], ['blockdev', '--rereadpt', '/dev/test'])
+            self.assertFalse(any('mkfs' in str(arg) for c in commands for arg in c))
+            receipt = json.loads((h.report / 'formatted.json').read_text())
+            self.assertTrue(receipt['passed'])
+            self.assertFalse(receipt['original_format_command_succeeded'])
+
+    def test_failed_verification_or_refresh_never_creates_receipt(self):
+        for failure in [0, 1, 3]:
+            with tempfile.TemporaryDirectory() as tmp:
+                h, d = self.fixture(tmp)
+                h.command.side_effect = [None] * failure + [RuntimeError('failed')]
+                with mock.patch.object(usb, 'identify', return_value=d):
+                    with self.assertRaises(RuntimeError):
+                        usb.finalize_format(h, d)
+                self.assertFalse((h.report / 'formatted.json').exists())
+
+    def test_stale_kernel_partitions_prevent_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h, d = self.fixture(tmp)
+            child = Path(d['sysfs']) / 'child'
+            child.mkdir()
+            (child / 'partition').write_text('1')
+            with mock.patch.object(usb, 'identify', return_value=d):
+                with self.assertRaisesRegex(RuntimeError, 'still exposes partitions'):
+                    usb.finalize_format(h, d)
+            self.assertFalse((h.report / 'formatted.json').exists())
+
 if __name__ == '__main__':
     unittest.main()
