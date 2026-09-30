@@ -2,7 +2,8 @@
 
 For the completed 0.0.1 source-release checks, see the
 [release verification record](release-verification.md). The historical image
-acceptance record below is retained.
+acceptance record below is retained. The [COW update](#file-data-cow-verification--2026-09-30)
+records the current file-data guarantee and checks.
 
 This verification record covers the temporary-image acceptance run on Linux on
 2026-09-28. Physical-device implementation and pending USB acceptance are tracked
@@ -78,3 +79,43 @@ migration, hard links, symlinks, special files, ACLs,
 extended attributes, full Unix ownership/modes, or advanced allocation operations
 are claimed. The adapter's direct I/O and serialized transactions favor a simple,
 testable POC over performance optimization.
+
+
+## File-data COW verification — 2026-09-30
+
+This update supersedes the historical mixed-data overwrite expectation above.
+The old torn-overwrite test now requires unchanged old contents when the first
+fresh-block write tears. The raw simulator demonstration still permits torn
+writes; the filesystem prevents those bytes from becoming reachable.
+
+Verified on Rust 1.98.1:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
+| `cargo test --workspace --all-targets --locked` | Passed; all 18 writable tests passed; four privileged loop-device tests remain ignored |
+| `cargo run -p xffs-sim --example crash_demo --locked` | Passed |
+| `./scripts/mount-smoke.sh` | Exit 77: UNMET PREREQUISITE, `/dev/fuse` unavailable |
+| `./scripts/writable-smoke.sh` | Exit 77: UNMET PREREQUISITE, `/dev/fuse` unavailable |
+
+The COW matrix derives write/flush failure positions from successful traces.
+It covers full and partial overwrite, unaligned multi-block committed prefixes,
+same-block and separate-block EOF-tail updates, and extension after shrink.
+Each boundary is tested with no persistence and torn prefixes of 1, 80, 2048,
+4095, and 4096 bytes. A no-failure run requires successful writes to survive.
+Recovery must expose exactly an allowed committed prefix; repeated reopening
+preserves contents and allocation counts. Subsequent writes and deletion restore
+the original free-space/inode counts. Separate tests interrupt recovery of a
+committed COW transaction and verify its replacement data survives.
+
+Full-image overwrites return ENOSPC with no write/flush. With one spare block,
+a replacement needing an overflow metadata block and a two-block EOF update both
+fail preflight without changing data or free space. Tests retain the existing
+256-image transaction and memory limits and add a 65,536-extent limit case;
+the writer remains usable after rejection. Mapping tests cover beginning,
+middle, end, and coalescing across neighboring extents.
+
+No physical device or destructive test was run, no new performance claim is
+made, and the simulator does not certify hardware flush behavior. Earlier
+toolchain and real-FUSE results above are historical, not results of this run.

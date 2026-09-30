@@ -58,7 +58,14 @@ Successful mutating core operations are durable under the
 [storage contract](docs/storage-contract.md). Application buffering is outside
 that guarantee. File-data updates use fresh blocks and recover as old or complete
 replacement contents per 4-KiB transaction. Overwrites require spare space and
-can return ENOSPC; multi-block requests can complete only a prefix.
+can return ENOSPC; multi-block requests can complete only a prefix. Fragmentation
+can also reach existing extent or metadata transaction limits. An I/O error may
+be reported after a transaction commits.
+
+Existing revision 2 images gain this behavior without migration; older writers
+remain compatible but do not provide the COW guarantee. Revision 1 remains
+read-only. This adds no snapshots, reflinks, metadata COW, batching, or
+whole-request atomicity. See [writable behavior](docs/writable.md) for details.
 For atomic whole-file replacement, write and fsync a temporary file, rename it
 over the destination, and fsync its parent directory. Open handles retain the
 old file until closed.

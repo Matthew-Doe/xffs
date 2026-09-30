@@ -17,11 +17,17 @@ never wrap. Journal payload is never reused before both controls are retired.
 A backend error after mutation starts faults the writer. Subsequent operations
 return an I/O-class error until reopening. Successful mutating core calls are
 durable under the storage contract. Application buffering is outside that
-contract. In-place data overwrites are not atomic: interrupted writes can leave
-mixed old and new data while metadata remains recoverable.
+contract. Every file-data update uses copy-on-write (COW): recovery exposes
+either the previous block contents or the complete replacement under the
+[storage contract](storage-contract.md). A backend failure can be reported after
+the transaction has committed, so an error does not promise rollback.
 
 Block allocation uses deterministic next-fit search and never reuses storage
-being freed by the same transaction. Adjacent logical/physical mappings coalesce.
+being freed by the same transaction. Each replacement splits the old extent
+around its logical block, then coalesces compatible neighbors before checking
+extent limits. The journal atomically records fresh allocation, old-block release,
+mappings, overflow metadata, and inode changes. Old storage remains unavailable
+until checkpointing and journal retirement complete successfully.
 New data blocks and exposed tails are initialized before metadata publication;
 sparse gaps remain unmapped and read as zeros. Each write request is at most 1 MiB
 and progresses in block-sized durable transactions. A short write reports only
@@ -31,13 +37,30 @@ Shrinking publishes the new size and old-size cleanup bound atomically. Cleanup
 releases at most 64 trailing data blocks per transaction, updating mappings,
 overflow chains, and bitmap together. Opening a writer resumes cleanup and
 reclaims detached inodes before returning. Extension zeros the former EOF tail
-before increasing size, so shrink/extend cannot reveal old contents.
+through COW before increasing size, so shrink/extend cannot reveal old contents.
+When the EOF tail and user bytes share a block, both changes use one replacement.
+When they affect different blocks, both replacements commit in one transaction.
 
 The allocation bitmap is retained as an ownership index after full opening
 validation. Mutations stage only affected inodes, mappings, bitmap blocks, and
 metadata images; they do not rescan the volume. Working-memory checks reserve
 space for staging and affected cached nodes before mutation. Indivisible edits
 larger than 256 metadata images return `TooBig` (`E2BIG` at the adapter).
+Fresh data targets must be distinct, previously free, and allocated by the edit.
+Allocation, mapping, transaction-capacity, and memory checks precede data writes.
+Preflight failures leave the current transaction unchanged and the writer usable;
+earlier pieces of a multi-block request remain committed.
+
+Overwrites require spare space and may return `ENOSPC`; there is no in-place
+fallback. An EOF update may need two fresh data blocks, and extent fragmentation
+may require additional metadata blocks or reach existing extent/transaction limits.
+No snapshots, reflinks, metadata COW, transaction batching, whole-request
+atomicity, or performance improvement are provided.
+
+Format revision 2, public APIs, CLI options, and request limits are unchanged.
+Existing revision 2 images gain COW behavior without migration when opened by
+this writer. Older writers can still open them but do not provide this guarantee.
+Revision 1 remains read-only.
 
 Namespace operations validate portable names and canonical-caseless uniqueness.
 Directory insertion reuses a block's available payload; deletion compacts only

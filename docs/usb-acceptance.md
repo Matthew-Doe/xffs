@@ -117,7 +117,9 @@ fails, the mountpoint is retained and reported; the hardware harness never
 recursively deletes a possibly mounted directory.
 
 The final drive is left XFFS and cleanly unmounted after a successful sequence.
-Incomplete in-place overwrites retain the existing mixed-old/new data limitation.
+The updated writer uses per-block file-data COW under the storage contract;
+multi-block requests can recover as a committed prefix. This does not certify
+that a physical device honors flushes. Older writers retain the mixed-data limitation.
 Partition formatting/resizing, restoration of Ventoy, desktop auto-mounting,
 kernel drivers, migration and stable compatibility remain out of scope.
 
