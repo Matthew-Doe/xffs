@@ -119,3 +119,13 @@ middle, end, and coalescing across neighboring extents.
 No physical device or destructive test was run, no new performance claim is
 made, and the simulator does not certify hardware flush behavior. Earlier
 toolchain and real-FUSE results above are historical, not results of this run.
+
+### FUSE retry — 2026-09-30
+
+After sandbox restrictions were removed, both image-backed smoke scripts passed
+with exit 0. `./scripts/mount-smoke.sh` verified clean and recovered read-only
+mounts and confirmed complete images remained unchanged.
+`./scripts/writable-smoke.sh` passed terminal operations, nano, durability,
+open-handle lifetimes, permissions, locking, and remount checks. The earlier
+exit-77 results above record the initial restricted environment; the FUSE
+prerequisite is now satisfied for this run. No physical-device test was run.
