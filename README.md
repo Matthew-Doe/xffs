@@ -153,3 +153,8 @@ format are documented in [USB acceptance](docs/usb-acceptance.md). See the
 8 MiB write including fsync averaged 0.137 MiB/s; the buffered read after
 reconnect averaged 205.9 MiB/s. These measure this implementation, not raw media
 bandwidth. Temporary image results are not USB acceptance.
+
+For reproducible XFFS/exFAT/FAT32/ext4 comparisons, see
+[filesystem benchmarking](docs/benchmarking.md). The separate benchmark harness
+supports disposable loop images, explicitly authorized whole-USB-disk runs,
+and offline report regeneration from saved results.

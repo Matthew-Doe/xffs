@@ -3,6 +3,7 @@
 *.image
 __pycache__/
 /usb-evidence-*/
+/benchmark-results/
 
 # Local planning records; excluded from future source releases.
 /design-decisions.md
