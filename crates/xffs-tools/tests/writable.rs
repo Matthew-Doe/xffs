@@ -447,6 +447,10 @@ fn inode_exhaustion_local_directory_edits_and_full_image() {
         }
     }
     assert_eq!(fs.statfs().unwrap().free_blocks, 0);
+    d.arm(usize::MAX, false);
+    assert!(matches!(fs.write_file(f, 0, b"x"), Err(FsError::NoSpace)));
+    assert_eq!(d.0.borrow().mutations, 0);
+    assert_eq!(fs.read_file(f, 0, BLOCK).unwrap(), vec![5; BLOCK]);
     fs.rename(ROOT, b"full", ROOT, b"FULL", false).unwrap();
     fs.truncate(f, 0).unwrap();
     fs.write_file(f, 3, b"x").unwrap();
@@ -907,7 +911,7 @@ fn torn_header_sequence_state_and_checksum_at_every_transaction_phase() {
 }
 
 #[test]
-fn interrupted_in_place_overwrite_preserves_metadata_but_may_mix_data() {
+fn interrupted_cow_overwrite_preserves_old_data() {
     let d = Shared::new(&fixture(FormatRevision::Two, None));
     let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
     let id = fs.create(ROOT, b"in-place", false).unwrap();
@@ -920,6 +924,5 @@ fn interrupted_in_place_overwrite_preserves_metadata_but_may_mix_data() {
     let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
     assert_eq!(ro.getattr(id).unwrap().size, 4096);
     let bytes = ro.read_file(id, 0, BLOCK).unwrap();
-    assert_eq!(&bytes[..128], &[2; 128]);
-    assert_eq!(&bytes[128..], &[1; BLOCK - 128]);
+    assert_eq!(bytes, [1; BLOCK]);
 }

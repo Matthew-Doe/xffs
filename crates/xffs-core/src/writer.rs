@@ -152,8 +152,15 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             checksum = crc32c::crc32c_append(checksum, image);
             payload.push(descriptor);
         }
+        let mut targets = std::collections::BTreeSet::new();
         for (n, _) in data {
-            require(self.view.superblock.layout.allocatable(*n), "data target")?;
+            require(
+                self.view.superblock.layout.allocatable(*n)
+                    && !self.used(*n)
+                    && !images.contains_key(n)
+                    && targets.insert(*n),
+                "fresh distinct data target",
+            )?;
         }
         let result = (|| {
             for (n, b) in data {
@@ -500,6 +507,9 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         if edit.images.len() > 256 {
             return Err(FsError::TooBig);
         }
+        for (n, _) in &edit.data {
+            require(edit.bits.get(n) == Some(&true), "allocated data target")?;
+        }
         self.commit(&edit.images, &edit.data)?;
         for (n, set) in edit.bits {
             let was = self.used(n);
@@ -537,17 +547,40 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             .find(|e| logical >= e.logical && logical < e.logical + e.length)
             .map(|e| e.physical + logical - e.logical)
     }
-    fn zero_tail(&mut self, edit: &mut Edit, node: &Node) -> Result<()> {
-        if !node.inode.size.is_multiple_of(4096)
-            && let Some(n) = Self::physical(node, node.inode.size / 4096)
-        {
-            let mut b = self.view.metadata.device.block(n)?;
-            b[(node.inode.size % 4096) as usize..].fill(0);
-            edit.data.push((n, b));
+    /// Repeated changes to a logical block share a single fresh replacement.
+    fn stage_data<'a>(
+        &mut self,
+        edit: &'a mut Edit,
+        node: &mut Node,
+        logical: u64,
+    ) -> Result<&'a mut Block> {
+        let old = Self::physical(node, logical);
+        if let Some(index) = edit.data.iter().position(|(n, _)| Some(*n) == old) {
+            return Ok(&mut edit.data[index].1);
+        }
+        let block = match old {
+            Some(n) => self.view.metadata.device.block(n)?,
+            None => [0; BLOCK],
+        };
+        let fresh = self.allocate(edit)?;
+        Self::replace_block(node, logical, fresh);
+        if let Some(n) = old {
+            edit.bits.insert(n, false);
+        }
+        edit.data.push((fresh, block));
+        Ok(&mut edit.data.last_mut().unwrap().1)
+    }
+    fn zero_tail(&mut self, edit: &mut Edit, node: &mut Node) -> Result<()> {
+        let size = node.inode.size;
+        if !size.is_multiple_of(4096) && Self::physical(node, size / 4096).is_some() {
+            self.stage_data(edit, node, size / 4096)?[(size % 4096) as usize..].fill(0);
         }
         Ok(())
     }
     /// At most 1 MiB per request. A short result counts only retired transactions.
+    /// Each block uses fresh storage (including overwrites, which may return NoSpace).
+    /// Recovery exposes old or complete replacement blocks, not whole-request atomicity.
+    /// An I/O error may occur after the affected transaction committed.
     pub fn write_file(&mut self, id: InodeId, offset: u64, bytes: &[u8]) -> Result<usize> {
         self.healthy()?;
         if bytes.len() > MAX_READ {
@@ -579,29 +612,12 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         let mut edit = self.edit(&[id])?;
         let mut node = self.view.node(id)?.clone();
         if offset + bytes.len() as u64 > node.inode.size {
-            self.zero_tail(&mut edit, &node)?;
+            self.zero_tail(&mut edit, &mut node)?;
         }
         let logical = offset / 4096;
-        let existing = Self::physical(&node, logical);
-        let n = if let Some(n) = existing {
-            n
-        } else {
-            let n = self.allocate(&mut edit)?;
-            Self::replace_block(&mut node, logical, n);
-            n
-        };
-        let mut b = if let Some((_, b)) = edit.data.iter().find(|(p, _)| *p == n) {
-            *b
-        } else if existing.is_some() {
-            self.view.metadata.device.block(n)?
-        } else {
-            [0; BLOCK]
-        };
+        let b = self.stage_data(&mut edit, &mut node, logical)?;
         let start = (offset % 4096) as usize;
         b[start..start + bytes.len()].copy_from_slice(bytes);
-        edit.data.retain(|(p, _)| *p != n);
-        edit.data.push((n, b));
-        Self::coalesce(&mut node);
         node.inode.size = node.inode.size.max(offset + bytes.len() as u64);
         node.inode.times[1] = now();
         node.inode.times[2] = now();
@@ -626,7 +642,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         if size < node.inode.size {
             node.inode.cleanup_bound = node.inode.size;
         } else {
-            self.zero_tail(&mut edit, &node)?;
+            self.zero_tail(&mut edit, &mut node)?;
         }
         node.inode.size = size;
         node.inode.times[1] = now();

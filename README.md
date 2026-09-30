@@ -56,7 +56,9 @@ Names preserve spelling and use Unicode 16.0 canonical-caseless matching.
 
 Successful mutating core operations are durable under the
 [storage contract](docs/storage-contract.md). Application buffering is outside
-that guarantee. Interrupted in-place overwrites can contain mixed old/new data.
+that guarantee. File-data updates use fresh blocks and recover as old or complete
+replacement contents per 4-KiB transaction. Overwrites require spare space and
+can return ENOSPC; multi-block requests can complete only a prefix.
 For atomic whole-file replacement, write and fsync a temporary file, rename it
 over the destination, and fsync its parent directory. Open handles retain the
 old file until closed.
