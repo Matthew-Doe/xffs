@@ -511,26 +511,30 @@ pub fn validate_serial(info: &xffs_core::DeviceInfo, expected: &str) -> ToolResu
 
 /// The formatter claim must have been released. Never restore partition tables.
 pub fn refresh_partition_view(path: &Path, expected: &xffs_core::DeviceInfo) -> ToolResult<()> {
+    refresh_partition_view_inner(path, expected).map_err(|error| {
+        format!("filesystem writing completed, but post-format verification failed: {error}; do not repeat formatting automatically").into()
+    })
+}
+
+fn refresh_partition_view_inner(path: &Path, expected: &xffs_core::DeviceInfo) -> ToolResult<()> {
     use xffs_core::LinuxBlockDevice;
-    let check = LinuxBlockDevice::open(path, AccessMode::ReadOnly)?;
-    if check.info() != expected {
-        return Err("device identity changed before partition refresh".into());
-    }
-    drop(check);
+    let start = std::time::Instant::now();
+    let mut claim = || {
+        let device = LinuxBlockDevice::open(path, AccessMode::ReadOnly)?;
+        let info = device.info().clone();
+        Ok((device, info))
+    };
+    let mut now = || start.elapsed();
+    let mut sleep = std::thread::sleep;
+    drop(claim_matching(expected, &mut claim, &mut now, &mut sleep)?);
     let status = std::process::Command::new("blockdev")
         .arg("--rereadpt")
         .arg(path)
         .status()?;
     if !status.success() {
-        return Err(
-            "format finished, but kernel partition refresh failed; do not mount stale partitions"
-                .into(),
-        );
+        return Err("kernel partition refresh failed; do not mount stale partitions".into());
     }
-    let check = LinuxBlockDevice::open(path, AccessMode::ReadOnly)?;
-    if check.info() != expected {
-        return Err("device identity changed after partition refresh".into());
-    }
+    let _check = claim_matching(expected, &mut claim, &mut now, &mut sleep)?;
     let sysfs = std::path::PathBuf::from(format!(
         "/sys/dev/block/{}:{}",
         expected.major, expected.minor
@@ -541,6 +545,37 @@ pub fn refresh_partition_view(path: &Path, expected: &xffs_core::DeviceInfo) -> 
         }
     }
     Ok(())
+}
+
+/// Each claim gets its own deadline. Only typed contention is retryable.
+fn claim_matching<T>(
+    expected: &xffs_core::DeviceInfo,
+    claim: &mut impl FnMut() -> std::result::Result<(T, xffs_core::DeviceInfo), xffs_core::DeviceError>,
+    now: &mut impl FnMut() -> std::time::Duration,
+    sleep: &mut impl FnMut(std::time::Duration),
+) -> std::result::Result<T, xffs_core::DeviceError> {
+    use std::time::Duration;
+    use xffs_core::DeviceError;
+    let deadline = now() + Duration::from_secs(15);
+    loop {
+        match claim() {
+            Ok((device, info)) => {
+                return if &info == expected {
+                    Ok(device)
+                } else {
+                    Err(DeviceError::IdentityChanged)
+                };
+            }
+            Err(DeviceError::LockContention) => {
+                let current = now();
+                if current >= deadline {
+                    return Err(DeviceError::LockContention);
+                }
+                sleep(Duration::from_millis(100).min(deadline - current));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub fn open_target(
@@ -601,6 +636,98 @@ pub fn verify_existing_format(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, time::Duration};
+    use xffs_core::{DeviceError, DeviceInfo};
+
+    fn identity() -> DeviceInfo {
+        DeviceInfo {
+            capacity: 32 << 20,
+            logical_sector: 512,
+            physical_sector: 512,
+            major: 7,
+            minor: 0,
+            serial: None,
+            usb: false,
+            removable: false,
+            disk_sequence: 42,
+        }
+    }
+
+    #[test]
+    fn claim_retries_transient_contention_with_independent_deadlines() {
+        let clock = Cell::new(Duration::ZERO);
+        for _ in 0..2 {
+            let mut attempts = 0;
+            let start = clock.get();
+            super::claim_matching(
+                &identity(),
+                &mut || {
+                    attempts += 1;
+                    if attempts < 4 {
+                        Err(DeviceError::LockContention)
+                    } else {
+                        Ok(((), identity()))
+                    }
+                },
+                &mut || clock.get(),
+                &mut |delay| {
+                    assert_eq!(delay, Duration::from_millis(100));
+                    clock.set(clock.get() + delay);
+                },
+            )
+            .unwrap();
+            assert_eq!(attempts, 4);
+            assert_eq!(clock.get() - start, Duration::from_millis(300));
+        }
+    }
+
+    #[test]
+    fn claim_contention_times_out() {
+        let clock = Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        let result = super::claim_matching::<()>(
+            &identity(),
+            &mut || {
+                attempts += 1;
+                Err(DeviceError::LockContention)
+            },
+            &mut || clock.get(),
+            &mut |delay| clock.set(clock.get() + delay),
+        );
+        assert!(matches!(result, Err(DeviceError::LockContention)));
+        assert_eq!(clock.get(), Duration::from_secs(15));
+        assert_eq!(attempts, 151);
+    }
+
+    #[test]
+    fn claim_rejects_replacement_and_permanent_errors_immediately() {
+        let mut changed = identity();
+        changed.disk_sequence += 1;
+        let result = super::claim_matching(
+            &identity(),
+            &mut || Ok(((), changed.clone())),
+            &mut || Duration::ZERO,
+            &mut |_| panic!("must not retry replacement"),
+        );
+        assert!(matches!(result, Err(DeviceError::IdentityChanged)));
+        for error in [
+            DeviceError::IdentityChanged,
+            DeviceError::UnsupportedGeometry,
+            DeviceError::UnsafeTopology("mounted".into()),
+        ] {
+            let mut error = Some(error);
+            assert!(
+                super::claim_matching::<()>(
+                    &identity(),
+                    &mut || Err(error.take().unwrap()),
+                    &mut || Duration::ZERO,
+                    &mut |_| panic!("must not retry permanent error")
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn incomplete_creation_is_removed_and_existing_path_is_preserved() {
         let p = std::env::temp_dir().join(format!("xffs-failure-{}.img", std::process::id()));
