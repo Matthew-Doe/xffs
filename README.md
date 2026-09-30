@@ -71,7 +71,8 @@ Cargo target names are `mount-xffs` and `mkfs-xffs`; `scripts/mount.xffs` and
 Migration, importers, hard links, symlinks, special files, full Unix ownership/modes,
 ACLs, xattrs, and advanced allocation operations remain deferred. Ordinary tests
 use images and simulated devices; privileged loop and USB tests require explicit
-invocation. Actual USB acceptance remains pending as recorded below.
+invocation. USB workload, reconnect, and removal trials have passed; remaining reporting
+and verification limits are recorded below.
 
 See the [format specification](docs/on-disk-format.md),
 [writable API and mount behavior](docs/writable.md),
@@ -138,5 +139,5 @@ requires the separate hardware trials.
 
 The serial-bound destructive USB harness, manual unplug protocol, and evidence
 format are documented in [USB acceptance](docs/usb-acceptance.md). See the
-[dated verification report](docs/hardware-results/2026-09-28.md) for actual passes
+[latest verification report](docs/hardware-results/2026-09-29.md) for actual passes
 and pending hardware trials; temporary image results are not USB acceptance.

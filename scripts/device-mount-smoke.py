@@ -78,6 +78,7 @@ def main():
             run([BIN / 'mkfs-xffs', image, '--size-mib', '32', '--uuid', '58464653-0000-0001-8000-000000000001'])
             device = run(['losetup', '--find', '--show', '--sector-size', sector, image], capture_output=True, text=True).stdout.strip()
             try:
+                run(['udevadm', 'settle', '--timeout=15'])
                 for mode in ['ro', 'rw', 'ro']:
                     before = hashlib.sha256(image.read_bytes()).hexdigest()
                     with (tmp / 'service.log').open('w+') as log:

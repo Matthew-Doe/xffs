@@ -33,6 +33,13 @@ fn attach(sector: u32) -> Loop {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    assert!(
+        Command::new("udevadm")
+            .args(["settle", "--timeout=15"])
+            .status()
+            .unwrap()
+            .success()
+    );
     Loop {
         path: String::from_utf8(result.stdout).unwrap().trim().into(),
         image,

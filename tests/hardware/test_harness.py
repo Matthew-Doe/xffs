@@ -4,6 +4,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+import contextlib
+import io
+import os
+import subprocess
+import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('usb', ROOT / 'scripts/usb-acceptance.py')
@@ -64,6 +71,157 @@ class EvidenceTests(unittest.TestCase):
         path.with_name('unrecorded').write_bytes(b'unknown')
         with self.assertRaises(AssertionError):
             usb.verify_trial(mount, report, 'create')
+
+class ProcessTests(unittest.TestCase):
+    def test_worker_output_is_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'worker.log'
+            with log.open('w') as stream:
+                proc = subprocess.Popen([sys.executable, '-u', '-c', 'print("stage complete")'], stdout=stream, start_new_session=True)
+            output = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(output):
+                    usb.wait_worker(proc, log, timeout=5)
+                self.assertIn('stage complete', output.getvalue())
+            finally:
+                usb.stop_worker(proc)
+
+    def test_stop_worker_allows_signal_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ready, cleaned = Path(tmp) / 'ready', Path(tmp) / 'cleaned'
+            code = ('import signal,time,pathlib,sys; '
+                    'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); '
+                    f'pathlib.Path({str(ready)!r}).touch(); '
+                    '\ntry: time.sleep(30)\nfinally: '
+                    f'pathlib.Path({str(cleaned)!r}).touch()')
+            proc = subprocess.Popen([sys.executable, '-c', code], start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    self.assertIsNone(proc.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                usb.stop_worker(proc)
+                self.assertTrue(cleaned.exists())
+                self.assertEqual(proc.returncode, 0)
+            finally:
+                usb.stop_worker(proc)
+
+    def test_mount_isolates_terminal_signals_and_preserves_interrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = usb.Harness.__new__(usb.Harness)
+            h.report = Path(tmp)
+            h.uid, h.gid = os.getuid(), os.getgid()
+            h.user = {}
+            h.command = mock.Mock(return_value=mock.Mock(returncode=1, stderr='LockContention'))
+            proc = mock.Mock(returncode=0)
+            with mock.patch.object(usb.subprocess, 'Popen', return_value=proc) as launch, \
+                 mock.patch.object(usb, 'is_mounted', side_effect=[True, True, False, False]), \
+                 mock.patch.object(usb, 'run') as unmount, \
+                 mock.patch.object(usb.os, 'chown'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(KeyboardInterrupt):
+                    with h.mount({'path': '/dev/test', 'diskseq': 1}, writable=True):
+                        raise KeyboardInterrupt()
+                self.assertTrue(launch.call_args.kwargs['start_new_session'])
+                self.assertEqual(unmount.call_args.args[0][0:2], ['fusermount3', '-u'])
+                proc.wait.assert_called_once_with(timeout=15)
+
+    def test_retry_preserves_partial_workload_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = Path(tmp)
+            (mount / 'persist').mkdir()
+            partial = mount / 'persist/throughput.bin'
+            partial.write_bytes(b'partial evidence')
+            with self.assertRaisesRegex(RuntimeError, 'use recover'):
+                usb.workload(mount, mount)
+            self.assertEqual(partial.read_bytes(), b'partial evidence')
+
+class ClaimRetryTests(unittest.TestCase):
+    def run_command(self, outcomes, times, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = usb.Harness.__new__(usb.Harness)
+            h.report = Path(tmp)
+            h.events = h.report / 'events.jsonl'
+            with mock.patch.object(usb.subprocess, 'run', side_effect=outcomes) as run, \
+                 mock.patch.object(usb.time, 'monotonic', side_effect=times), \
+                 mock.patch.object(usb.time, 'sleep'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    h.command(['xffs-check', '--expect-serial', usb.SERIAL], 'check', **kwargs)
+                except RuntimeError:
+                    failed = True
+                else:
+                    failed = False
+                events = [json.loads(line) for line in h.events.read_text().splitlines()]
+                return run.call_count, failed, events, run.call_args_list
+
+    def test_busy_then_success_retains_identity_arguments_and_evidence(self):
+        busy = subprocess.CompletedProcess([], 1, '', 'Error: LockContention\n')
+        ok = subprocess.CompletedProcess([], 0, 'valid', '')
+        count, failed, events, calls = self.run_command([busy, ok], [0, 1, 2], retry_lock=True)
+        self.assertEqual(count, 2)
+        self.assertFalse(failed)
+        self.assertEqual([e['exit'] for e in events], [1, 0])
+        self.assertEqual(calls[0], calls[1])
+
+    def test_persistent_busy_stops_at_deadline(self):
+        busy = subprocess.CompletedProcess([], 1, '', 'Error: LockContention\n')
+        count, failed, _, _ = self.run_command([busy, busy], [0, 1, 16], retry_lock=True)
+        self.assertEqual(count, 2)
+        self.assertTrue(failed)
+
+    def test_other_errors_and_default_commands_are_never_retried(self):
+        for error, retry in [('Error: IdentityChanged', True), ('Error: Corrupt', True),
+                             ('Error: LockContention', False)]:
+            result = subprocess.CompletedProcess([], 1, '', error)
+            count, failed, _, _ = self.run_command([result], [0, 1], retry_lock=retry)
+            self.assertEqual(count, 1)
+            self.assertTrue(failed)
+
+class ReconnectTests(unittest.TestCase):
+    old = {'serial': usb.SERIAL, 'size': 124623257600, 'diskseq': 6}
+
+    def test_early_enter_waits_for_absent_then_partial_then_new_device(self):
+        new = dict(self.old, diskseq=7)
+        with mock.patch.object(usb, 'identify', side_effect=[usb.DeviceNotReady(), FileNotFoundError(), new]), \
+             mock.patch.object(usb.time, 'sleep'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(usb.wait_for_reconnect(self.old), new)
+
+    def test_old_sequence_is_not_accepted(self):
+        new = dict(self.old, diskseq=7)
+        with mock.patch.object(usb, 'identify', side_effect=[self.old, new]) as identify, \
+             mock.patch.object(usb.time, 'sleep'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(usb.wait_for_reconnect(self.old), new)
+            self.assertEqual(identify.call_count, 2)
+
+    def test_capacity_and_identity_failures_are_not_retried(self):
+        for result in [dict(self.old, size=1, diskseq=7), RuntimeError('duplicate serial')]:
+            with mock.patch.object(usb, 'identify', side_effect=[result]) as identify:
+                with self.assertRaises(RuntimeError):
+                    usb.wait_for_reconnect(self.old)
+                self.assertEqual(identify.call_count, 1)
+
+    def test_timeout_retains_pending_trial(self):
+        with mock.patch.object(usb, 'identify', side_effect=usb.DeviceNotReady()), \
+             mock.patch.object(usb.time, 'monotonic', side_effect=[0, 61]):
+            with self.assertRaisesRegex(TimeoutError, 'resume-trial'):
+                usb.wait_for_reconnect(self.old)
+
+    def test_resume_requires_recorded_removal_and_unpassed_trial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp)
+            (report / 'trial-replace.jsonl').write_text('')
+            (report / 'events.jsonl').write_text('')
+            with self.assertRaisesRegex(RuntimeError, 'no recorded removal'):
+                usb.observed_removal(report, 'replace')
+            usb.record(report / 'events.jsonl', {'event': 'removal-observed', 'kind': 'replace', 'device': self.old})
+            self.assertEqual(usb.observed_removal(report, 'replace'), self.old)
+            (report / 'passed-replace.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'already passed'):
+                usb.observed_removal(report, 'replace')
 
 if __name__ == '__main__':
     unittest.main()

@@ -29,6 +29,44 @@ def run(args, **kwargs):
     return subprocess.run([str(x) for x in args], check=True, **kwargs)
 
 
+def progress(message):
+    print(message, flush=True)
+
+
+def stop_worker(proc):
+    if proc.poll() is None:
+        # Give Python finally blocks (including nano cleanup) a chance to run.
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+
+
+def wait_worker(proc, logpath, timeout=180):
+    start = time.monotonic()
+    heartbeat = start + 5
+    with logpath.open() as output:
+        while True:
+            text = output.read()
+            if text:
+                print(text, end='', flush=True)
+            status = proc.poll()
+            if status is not None:
+                print(output.read(), end='', flush=True)
+                if status:
+                    raise RuntimeError(f'worker failed ({status}); see {logpath}')
+                return
+            now = time.monotonic()
+            if now - start >= timeout:
+                raise TimeoutError(f'worker deadline exceeded; see {logpath}')
+            if now >= heartbeat:
+                progress(f'Worker active ({now - start:.0f}s elapsed); waiting for durable I/O. Ctrl+C cancels.')
+                heartbeat = now + 5
+            time.sleep(.1)
+
+
 def save(path, value):
     temporary = path.with_suffix(path.suffix + '.new')
     with temporary.open('w') as f:
@@ -55,10 +93,16 @@ def record(path, value):
         os.fsync(f.fileno())
 
 
+class DeviceNotReady(RuntimeError):
+    pass
+
+
 def identify():
     data = json.loads(run(['lsblk', '--json', '--bytes', '--nodeps', '--output',
                            'PATH,SERIAL,SIZE,TYPE,TRAN,RM'], capture_output=True, text=True).stdout)
     candidates = [d for d in data['blockdevices'] if d.get('serial') == SERIAL]
+    if not candidates:
+        raise DeviceNotReady(f'USB serial {SERIAL} has not enumerated yet')
     if len(candidates) != 1:
         raise RuntimeError(f'expected exactly one disk with serial {SERIAL}, found {len(candidates)}')
     d = candidates[0]
@@ -150,9 +194,19 @@ def nano_save(path):
                 pass
 
 
-def workload(mount, report):
+def workload(mount, report, fresh=False):
+    if (report / 'baseline.json').exists():
+        raise RuntimeError('a completed baseline already exists; verify it instead of replacing it')
+    if not fresh and ((mount / 'acceptance-work').exists() or (mount / 'persist').exists()):
+        raise RuntimeError('prior workload files exist; use recover and inspect them before another workload')
+    suffix = '-' + uuid.uuid4().hex if fresh else ''
+    before = snapshot(mount) if fresh else {}
+    if fresh:
+        save(report / ('workload-attempt' + suffix + '.json'), {'preserved_files': before})
+        progress('Preserving existing files; using new test directories with suffix ' + suffix)
+    progress('Testing directories, writes, append, rename, truncate and sparse files...')
     baseline = os.statvfs(mount)
-    work = mount / 'acceptance-work'
+    work = mount / ('acceptance-work' + suffix)
     work.mkdir()
     (work / 'nested').mkdir()
     p = work / 'nested/original'
@@ -187,22 +241,35 @@ def workload(mount, report):
     with (work / 'renamed').open('rb') as f:
         (work / 'renamed').unlink()
         assert f.read() == b'fir'
+    progress('Testing a real nano save...')
     nano_save(work / 'nano.txt')
     shutil.rmtree(work)
     sync_dir(mount)
     after = os.statvfs(mount)
     assert (after.f_bfree, after.f_ffree) == (baseline.f_bfree, baseline.f_ffree)
-    persist = mount / 'persist'
+    progress('Free-space restoration passed; preparing persistent files...')
+    persist = mount / ('persist' + suffix)
     persist.mkdir()
     write_sync(persist / 'anchor', b'acknowledged immutable USB data\n' * 1024)
     data = bytes(range(256)) * (8 * 1024 * 1024 // 256)
     start = time.monotonic()
-    write_sync(persist / 'throughput.bin', data)
+    progress('Writing 8 MiB to USB with durability barriers; this can take minutes...')
+    with (persist / 'throughput.bin').open('xb') as f:
+        for offset in range(0, len(data), 1024 * 1024):
+            f.write(data[offset:offset + 1024 * 1024])
+            f.flush()
+            os.fsync(f.fileno())
+            progress(f'Durable write: {offset // (1024 * 1024) + 1}/8 MiB')
+    sync_dir(persist)
     elapsed = time.monotonic() - start
-    save(report / 'performance.json', {'bytes': len(data), 'write_fsync_seconds': elapsed,
+    save(report / 'performance.json', {'path': str((persist / 'throughput.bin').relative_to(mount)),
+         'bytes': len(data), 'write_fsync_seconds': elapsed,
          'write_fsync_mib_s': len(data) / 1024**2 / elapsed,
          'scope': 'USB + buffered Linux backend + FUSE + transaction flushes; not raw media bandwidth'})
-    save(report / 'baseline.json', snapshot(mount))
+    finished = snapshot(mount)
+    for name, entry in before.items():
+        assert finished.get(name) == entry, f'pre-existing file changed: {name}'
+    save(report / 'baseline.json', finished)
     save(report / 'workload.json', {'passed': True, 'nano': 'real PTY save', 'free_space_restored': True})
 
 
@@ -310,8 +377,9 @@ def verify_trial(mount, report, kind):
 def verify(mount, report, trial=None, cold=False):
     expected = json.loads((report / 'baseline.json').read_text())
     if cold:
+        perf = json.loads((report / 'performance.json').read_text())
         start = time.monotonic()
-        data = (mount / 'persist/throughput.bin').read_bytes()
+        data = (mount / perf.get('path', 'persist/throughput.bin')).read_bytes()
         elapsed = time.monotonic() - start
         perf = json.loads((report / 'performance.json').read_text())
         perf.update(reconnected_read_seconds=elapsed, reconnected_read_mib_s=len(data) / 1024**2 / elapsed)
@@ -383,39 +451,53 @@ class Harness:
         self.events = self.report / 'events.jsonl'
         self.user = {'user': self.uid, 'group': self.gid, 'extra_groups': []}
 
-    def command(self, args, label, required=True):
-        result = subprocess.run([str(x) for x in args], capture_output=True, text=True, timeout=120)
-        stamp = str(time.time_ns())
-        (self.report / (stamp + '-' + label + '.log')).write_text(result.stdout + result.stderr)
-        record(self.events, {'command': [str(x) for x in args], 'exit': result.returncode, 'label': label})
-        if required and result.returncode:
-            raise RuntimeError(f'{label} failed: {result.stderr}; evidence retained in {self.report}')
-        return result
+    def command(self, args, label, required=True, retry_lock=False):
+        progress(f'{label}: running...')
+        deadline = time.monotonic() + 15
+        attempt = 0
+        while True:
+            attempt += 1
+            result = subprocess.run([str(x) for x in args], capture_output=True, text=True, timeout=120)
+            stamp = str(time.time_ns())
+            (self.report / (stamp + '-' + label + '.log')).write_text(result.stdout + result.stderr)
+            record(self.events, {'command': [str(x) for x in args], 'exit': result.returncode,
+                                 'label': label, 'attempt': attempt})
+            # Retry only read-only commands that failed to acquire the claim.
+            # Never retry formatting, recovery, or a filesystem/identity error.
+            busy = result.returncode != 0 and result.stderr.strip() == 'Error: LockContention'
+            remaining = deadline - time.monotonic()
+            if retry_lock and busy and remaining > 0:
+                progress(f'{label}: device temporarily busy; retrying exclusive claim...')
+                time.sleep(min(1, remaining))
+                continue
+            if required and result.returncode:
+                raise RuntimeError(f'{label} failed: {result.stderr}; evidence retained in {self.report}')
+            if not result.returncode and label == 'check':
+                progress(result.stdout.strip())
+            return result
 
     def identity_args(self, d):
         return ['--expect-serial', SERIAL, '--expect-disk-sequence', str(d['diskseq'])]
 
     def check(self, d, inspect=False):
         if inspect:
-            self.command([BIN / 'xffs-inspect', d['path'], '--device'] + self.identity_args(d), 'raw-inspect', required=False)
-        self.command([BIN / 'xffs-check', d['path'], '--device', '--memory-mib', '512'] + self.identity_args(d), 'check')
+            self.command([BIN / 'xffs-inspect', d['path'], '--device'] + self.identity_args(d), 'raw-inspect', required=False, retry_lock=True)
+        self.command([BIN / 'xffs-check', d['path'], '--device', '--memory-mib', '512'] + self.identity_args(d), 'check', retry_lock=True)
 
     def worker(self, mode, mount, kind=None, wait=True):
-        args = [sys.executable, __file__, '_worker', mode, str(mount), str(self.report)]
+        args = [sys.executable, '-u', __file__, '_worker', mode, str(mount), str(self.report)]
         if kind:
             args.append(kind)
-        log = (self.report / (str(time.time_ns()) + '-worker.log')).open('w')
-        proc = subprocess.Popen(args, stdout=log, stderr=log, start_new_session=True, **self.user)
-        log.close()
+        logpath = self.report / (str(time.time_ns()) + '-worker.log')
+        with logpath.open('w') as log:
+            proc = subprocess.Popen(args, stdout=log, stderr=log, start_new_session=True, **self.user)
         if not wait:
             return proc
+        progress(f'{mode}: started; log {logpath.name}')
         try:
-            if proc.wait(timeout=180):
-                raise RuntimeError('worker failed; see host worker log')
+            wait_worker(proc, logpath)
         finally:
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=10)
+            stop_worker(proc)
 
     @contextmanager
     def mount(self, d, writable=False, abrupt=False):
@@ -430,7 +512,8 @@ class Harness:
             if writable:
                 args.append('--rw')
             with (self.report / (str(time.time_ns()) + '-mount.log')).open('w') as log:
-                proc = subprocess.Popen(args, stdout=log, stderr=log)
+                proc = subprocess.Popen(args, stdout=log, stderr=log, start_new_session=True)
+                progress('Opening filesystem and completing recovery before mount...')
                 try:
                     deadline = time.monotonic() + 30
                     while not is_mounted(mount):
@@ -439,8 +522,11 @@ class Harness:
                         time.sleep(.05)
                     conflict = self.command([BIN / 'xffs-check', d['path'], '--device'], 'exclusion', required=False)
                     assert conflict.returncode and 'LockContention' in conflict.stderr, 'exclusive claim was not confirmed'
+                    progress(f'Mounted at {mount}')
                     yield mount
                 finally:
+                    active_error = sys.exc_info()[1]
+                    progress('Stopping workload and unmounting; please wait...')
                     try:
                         if is_mounted(mount):
                             run(['fusermount3', '-uz' if abrupt else '-u', mount], **self.user)
@@ -451,7 +537,12 @@ class Harness:
                             proc.kill()
                             proc.wait(timeout=5)
                     if not abrupt and proc.returncode:
-                        raise RuntimeError(f'unclean mount service exit: {proc.returncode}')
+                        message = f'unclean mount service exit: {proc.returncode}'
+                        if active_error is None:
+                            raise RuntimeError(message)
+                        progress(message)
+                    elif not is_mounted(mount):
+                        progress('Unmounted; service exited.')
         finally:
             # Never recursively remove a directory which may still contain a mount.
             mount = tmp / 'mount'
@@ -469,25 +560,71 @@ class Harness:
         assert sectors_written(d) == before, 'read-only service caused block-device writes'
 
 
+def wait_for_reconnect(old, timeout=60):
+    deadline = time.monotonic() + timeout
+    notice = 0
+    while True:
+        try:
+            new = identify()
+        except (DeviceNotReady, FileNotFoundError):
+            new = None
+        if new is not None:
+            if new['size'] != old['size']:
+                raise RuntimeError('reconnect capacity mismatch; refusing device')
+            if new['diskseq'] != old['diskseq']:
+                progress('Matching USB enumerated; continuing verification.')
+                return new
+        now = time.monotonic()
+        if now >= deadline:
+            raise TimeoutError('USB did not enumerate within 60 seconds; evidence retained. '
+                               'For an interrupted trial, use resume-trial KIND after reconnecting.')
+        if now >= notice:
+            progress('Waiting for the matching USB to enumerate (up to 60 seconds)...')
+            notice = now + 5
+        time.sleep(min(.5, deadline - now))
+
+
+def observed_removal(report, kind):
+    if (report / ('passed-' + kind + '.json')).exists():
+        raise RuntimeError('this trial already passed; do not repeat it')
+    if not (report / ('trial-' + kind + '.jsonl')).exists():
+        raise RuntimeError('no trial intentions exist to resume')
+    events = [json.loads(line) for line in (report / 'events.jsonl').read_text().splitlines()]
+    removals = [e for e in events if e.get('event') == 'removal-observed' and e.get('kind') == kind]
+    if not removals or removals[-1]['device']['serial'] != SERIAL:
+        raise RuntimeError('no recorded removal for this trial; use verify instead')
+    return removals[-1]['device']
+
+
+def complete_trial(h, d, kind):
+    h.check(d, inspect=True)
+    h.readonly(d, trial=kind)
+    with h.mount(d, writable=True) as mount:
+        h.worker('verify-trial', mount, kind)
+        h.worker('snapshot', mount)
+    h.check(d)
+    save(h.report / ('passed-' + kind + '.json'), {'passed': True, 'diskseq': d['diskseq']})
+
+
 def reconnect(old):
     input('Physically unplug the selected USB drive now, then press Enter: ')
     if not gone(old):
         raise RuntimeError('removal not observed; unplug trial is NOT a pass')
-    input('Reconnect the USB drive, wait for enumeration, then press Enter: ')
-    new = identify()
-    if new['diskseq'] == old['diskseq'] or new['size'] != old['size']:
-        raise RuntimeError('reconnect identity/sequence verification failed')
-    return new
+    input('Reconnect the USB drive, then press Enter (enumeration will be awaited): ')
+    return wait_for_reconnect(old)
 
 
 def worker_main():
     mode, mount, report = sys.argv[2:5]
     mount, report = Path(mount), Path(report)
     kind = sys.argv[5] if len(sys.argv) > 5 else None
-    if mode == 'workload':
-        workload(mount, report)
+    if mode in ('workload', 'resume-workload'):
+        workload(mount, report, fresh=mode == 'resume-workload')
     elif mode == 'trial':
         trial_worker(mount, report, kind)
+    elif mode == 'inventory':
+        progress('Recording current files without changing or deleting them...')
+        save(report / (str(time.time_ns()) + '-recovery-inventory.json'), snapshot(mount))
     elif mode == 'snapshot':
         save(report / 'baseline.json', snapshot(mount))
     elif mode == 'readonly':
@@ -509,10 +646,12 @@ def main():
     sub.add_parser('identify')
     fmt = sub.add_parser('format')
     fmt.add_argument('--erase', action='store_true', required=True)
-    for action in ['workload', 'reconnect', 'verify', 'finish', 'accept']:
+    for action in ['workload', 'reconnect', 'verify', 'finish', 'accept', 'recover', 'check', 'resume-workload']:
         sub.add_parser(action)
     trial = sub.add_parser('trial')
     trial.add_argument('kind', choices=['create', 'replace', 'cleanup'])
+    resume = sub.add_parser('resume-trial')
+    resume.add_argument('kind', choices=['create', 'replace', 'cleanup'])
     args = parser.parse_args()
     if args.action == 'accept':
         # Reusable acceptance never invokes formatting. Each child has its own
@@ -524,7 +663,11 @@ def main():
                      ['trial', 'replace'], ['trial', 'cleanup'], ['finish']]:
             run(common + step, timeout=620)
         return
-    d = identify()
+    if args.action == 'resume-trial':
+        old = observed_removal(args.report_dir, args.kind)
+        d = wait_for_reconnect(old)
+    else:
+        d = identify()
     if args.action == 'identify':
         print(json.dumps(d, indent=2))
         return
@@ -540,10 +683,18 @@ def main():
                    '--uuid', filesystem_uuid, '--inodes', '65536'], 'format')
         h.check(d)
         save(h.report / 'formatted.json', {'passed': True, 'device': d, 'uuid': filesystem_uuid})
-    elif args.action == 'workload':
+    elif args.action == 'check':
+        h.check(d)
+    elif args.action == 'recover':
+        h.check(d, inspect=True)
+        with h.mount(d, writable=True) as mount:
+            h.worker('inventory', mount)
+        h.check(d)
+        record(h.events, {'event': 'recovery-complete', 'acceptance_pass': False})
+    elif args.action in ('workload', 'resume-workload'):
         h.check(d)
         with h.mount(d, writable=True) as mount:
-            h.worker('workload', mount)
+            h.worker(args.action, mount)
         h.check(d)
         h.readonly(d)
     elif args.action == 'reconnect':
@@ -554,6 +705,8 @@ def main():
         with h.mount(d, writable=True) as mount:
             h.worker('verify', mount)
         h.check(d)
+    elif args.action == 'resume-trial':
+        complete_trial(h, d, args.kind)
     elif args.action == 'trial':
         kind = args.kind
         if (h.report / ('trial-' + kind + '.jsonl')).exists():
@@ -582,18 +735,9 @@ def main():
                 if worker.poll() is None:
                     os.killpg(worker.pid, signal.SIGKILL)
                     worker.wait(timeout=10)
-        input('Reconnect the USB drive, wait for enumeration, then press Enter: ')
-        new = identify()
-        if new['diskseq'] == d['diskseq'] or new['size'] != d['size']:
-            raise RuntimeError('reconnect identity verification failed')
-        d = new
-        h.check(d, inspect=True)
-        h.readonly(d, trial=kind)
-        with h.mount(d, writable=True) as mount:
-            h.worker('verify-trial', mount, kind)
-            h.worker('snapshot', mount)
-        h.check(d)
-        save(h.report / ('passed-' + kind + '.json'), {'passed': True, 'diskseq': d['diskseq']})
+        input('Reconnect the USB drive, then press Enter (enumeration will be awaited): ')
+        d = wait_for_reconnect(d)
+        complete_trial(h, d, kind)
     else:
         h.check(d, inspect=True)
         # An interrupted trial can be verified/recovered without reformatting.
@@ -617,6 +761,9 @@ def main():
             missing = [p for p in required if not (h.report / p).exists()]
             save(h.report / 'final.json', {'check_passed': True, 'cleanly_unmounted': True,
                  'acceptance_complete': not missing, 'pending': missing})
+            if missing:
+                progress('Filesystem checks passed; acceptance report is incomplete: ' + ', '.join(missing))
+                progress('Preserve the evidence; do not reformat to fill a missing receipt.')
     if args.action == 'reconnect':
         save(h.report / 'passed-reconnect.json', {'passed': True, 'diskseq': d['diskseq']})
     record(h.events, {'event': 'complete', 'action': args.action, 'device': d})
@@ -632,4 +779,8 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '_worker':
         worker_main()
     else:
-        main()
+        try:
+            main()
+        except KeyboardInterrupt:
+            print('Cancelled. Partial files and host evidence retained; use recover before retrying.', file=sys.stderr, flush=True)
+            sys.exit(130)

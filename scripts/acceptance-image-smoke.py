@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -32,7 +33,21 @@ with tempfile.TemporaryDirectory(prefix='xffs-acceptance-image-') as tmp:
                         raise RuntimeError(log.read())
                     time.sleep(.05)
                 mode = 'workload' if writable else 'verify'
+                if '--resume' in sys.argv:
+                    if writable:
+                        (mount / 'persist').mkdir()
+                        usb.write_sync(mount / 'persist/throughput.bin', b'partial evidence')
+                        (mount / 'acceptance-work').mkdir()
+                        usb.write_sync(mount / 'acceptance-work/retained', b'old work')
+                        usb.write_sync(mount / 'test.txt', b'user file')
+                        mode = 'resume-workload'
+                    else:
+                        mode = 'verify-cold'
                 usb.run(['python3', ROOT / 'scripts/usb-acceptance.py', '_worker', mode, mount, report], timeout=180)
+                if '--resume' in sys.argv:
+                    assert (mount / 'persist/throughput.bin').read_bytes() == b'partial evidence'
+                    assert (mount / 'acceptance-work/retained').read_bytes() == b'old work'
+                    assert (mount / 'test.txt').read_bytes() == b'user file'
                 if not writable:
                     usb.run(['python3', ROOT / 'scripts/usb-acceptance.py', '_worker', 'readonly', mount, report])
             finally:

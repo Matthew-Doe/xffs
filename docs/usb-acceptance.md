@@ -120,3 +120,75 @@ The final drive is left XFFS and cleanly unmounted after a successful sequence.
 Incomplete in-place overwrites retain the existing mixed-old/new data limitation.
 Partition formatting/resizing, restoration of Ventoy, desktop auto-mounting,
 kernel drivers, migration and stable compatibility remain out of scope.
+
+## Cancelling a slow workload
+
+The workload prints stages, an activity message every five seconds, and durable
+progress for each MiB of the throughput write. USB transaction flushes can make
+this phase take substantially longer than the tmpfs image test. Ctrl+C cancels
+the worker first; the FUSE service is isolated from terminal signals so cleanup
+can unmount it normally. Interrupted files and host evidence are preserved.
+
+If a baseline workload was interrupted before `baseline.json` was written, use
+`recover` instead of `verify` or repeating `workload`:
+
+```sh
+sudo python3 scripts/usb-acceptance.py \
+  --expect-serial 0085199340190280 --report-dir "$PWD/usb-evidence-2026-09-28-manual" \
+  recover
+```
+
+This checks the recovered view, opens writable to finish recovery, saves a dated
+`*-recovery-inventory.json`, unmounts, and checks again. It does not delete or
+rewrite test files, replace the baseline, or establish an acceptance pass.
+A subsequent workload refuses existing `acceptance-work` or `persist` entries;
+inspect the retained files before deciding how to resume the test.
+
+After clean unmount, another device probe may briefly hold a conflicting claim.
+Read-only `check` and raw inspection retry only an exact `LockContention` failure
+for up to 15 seconds of contention waiting, recording every attempt. Serial and
+disk-sequence expectations remain unchanged. Identity and filesystem errors are
+not retried; formatting and writable recovery are never automatically retried.
+The standalone `check` action performs only read-only validation, so it can finish
+a post-unmount check without rerunning a workload or writable recovery.
+
+After recovery and inspection, `resume-workload` runs the baseline workload in
+new UUID-suffixed directories. It preserves existing test/user files and records
+their hashes before writing, then verifies those entries are unchanged before
+publishing the new baseline. It does not reformat, delete old partial files, or
+replace a completed baseline. The throughput file's relative path is recorded
+in `performance.json` for subsequent reconnect measurements.
+
+```sh
+sudo python3 scripts/usb-acceptance.py \
+  --expect-serial 0085199340190280 --report-dir "$PWD/usb-evidence-2026-09-28-manual" \
+  resume-workload
+```
+
+Leave the USB connected until the command finishes. Once it passes, use
+`reconnect` to compare the completed baseline across a coordinated clean unplug,
+then proceed to the abrupt-removal trials. An earlier reconnect without a
+completed baseline is useful validation but does not replace that comparison.
+
+## Early Enter during reconnection
+
+Both reconnect prompts wait up to 60 seconds after Enter for the selected serial
+to enumerate with a new disk sequence and the same capacity. Temporary absence
+or a disappearing sysfs entry is retried; duplicate identity, wrong transport,
+and wrong capacity remain errors. The original disk sequence is never accepted.
+
+If a trial stopped after its physical removal was recorded but before reconnect
+verification, resume that verification without starting another workload:
+
+```sh
+sudo python3 scripts/usb-acceptance.py \
+  --expect-serial 0085199340190280 --report-dir "$PWD/usb-evidence-2026-09-28-manual" \
+  resume-trial replace
+```
+
+`resume-trial KIND` requires the original intentions log and an observed-removal
+event for that kind, refuses already-passed trials, and runs the same read-only
+validation, writable recovery, acknowledgement checks and final check as the
+original trial. Only then does it mark the trial passed. It does not repeat the
+unplug or reformat. Without an observed-removal record, use `verify`; that alone
+still cannot establish a physical-removal pass.

@@ -1,0 +1,35 @@
+{
+  "final.json": {
+    "acceptance_complete": false,
+    "check_passed": true,
+    "cleanly_unmounted": true,
+    "pending": [
+      "formatted.json"
+    ]
+  },
+  "passed-cleanup.json": {
+    "diskseq": 8,
+    "passed": true
+  },
+  "passed-create.json": {
+    "diskseq": 6,
+    "passed": true
+  },
+  "passed-reconnect.json": {
+    "diskseq": 5,
+    "passed": true
+  },
+  "passed-replace.json": {
+    "diskseq": 7,
+    "passed": true
+  },
+  "performance.json": {
+    "bytes": 8388608,
+    "path": "persist-ab29e9d6e6cb4b7eb88f9fe06b474074/throughput.bin",
+    "reconnected_read_mib_s": 205.87545914103234,
+    "reconnected_read_seconds": 0.038858443999970405,
+    "scope": "USB + buffered Linux backend + FUSE + transaction flushes; not raw media bandwidth",
+    "write_fsync_mib_s": 0.1367461056224181,
+    "write_fsync_seconds": 58.50258011799997
+  }
+}

@@ -143,6 +143,13 @@ fn loop_format_check_and_writable_reopen() {
             }
         }
         let _cleanup = Cleanup(path.clone(), image);
+        assert!(
+            Command::new("udevadm")
+                .args(["settle", "--timeout=15"])
+                .status()
+                .unwrap()
+                .success()
+        );
         let mut d = LinuxBlockDevice::open(&path, AccessMode::ReadWrite).unwrap();
         let info = d.info().clone();
         format_empty(&mut d, [8; 16], Some(256), FormatRevision::Two).unwrap();
