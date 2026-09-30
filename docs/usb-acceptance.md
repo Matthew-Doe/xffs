@@ -62,7 +62,7 @@ sudo python3 scripts/usb-acceptance.py \
   accept
 ```
 
-`accept` never formats. It runs the workload, clean reconnect, three abrupt
+`accept` never formats. It runs the workload, clean reconnect, four abrupt
 removal trials, and final verification in sequence, stopping on any failure.
 It prompts for physical unplug/reconnect in your terminal. Keep the drive
 unplugged until asked to reconnect: the old service must release its descriptor.
@@ -81,6 +81,10 @@ The same phases are individually reusable by replacing `accept` with:
 - `trial create`: create and append to new files; completed files become immutable.
 - `trial replace`: prepare old/new files and atomically replace each old name.
 - `trial cleanup`: truncate and delete newly created files.
+- `trial cow`: initialize and sync files, then overwrite existing blocks without
+  truncate or rename. Alternates three full blocks and unaligned partial updates
+  across three blocks. Checks unchanged bytes, old-or-new block contents,
+  committed prefixes, and survival of acknowledged overwrites.
 - `verify`: inspect read-only, validate the recovered view, mount writable to
   complete recovery, compare acknowledged content and validate interrupted
   outcomes. It never reformats or silently restarts a trial.
@@ -217,3 +221,31 @@ sudo python3 scripts/usb-acceptance.py \
 No mkfs operation is invoked and no file data is erased. Existing evidence is
 preserved. A failed verification or refresh leaves the missing receipt missing;
 do not manually invent a passing receipt or reformat to fix a reporting gap.
+
+
+## Adding COW verification to an existing acceptance run
+
+Keep the existing drive and evidence; do not format or repeat `accept`.
+For the completed September 30 run, use these fish-compatible commands:
+
+```fish
+set REPORT /home/matthewd/devel/xffs/usb-evidence-20260930-123545
+sudo python3 scripts/usb-acceptance.py \
+  --expect-serial 0085199340190280 --report-dir "$REPORT" trial cow
+and sudo python3 scripts/usb-acceptance.py \
+  --expect-serial 0085199340190280 --report-dir "$REPORT" finish
+```
+
+Follow the unplug/reconnect prompts. The COW trial publishes readiness only after
+the first old file is durable and its overwrite intent is recorded on the host.
+An unacknowledged overwrite may recover any complete block prefix; torn blocks,
+non-prefix replacements, missing initialized files, size changes, and lost
+acknowledged overwrites fail verification. Initialization interrupted on later
+files is checked separately. New and old bytes differ throughout every updated
+range. The existing filesystem checker validates recovered allocation ownership.
+
+New full acceptance runs include COW and require `passed-cow.json`; earlier
+reports remain historical evidence for their original three trials. Interrupted
+COW trials use the existing `verify` / `resume-trial cow` workflow.
+A physical trial samples an uncontrolled failure point; it does not replace
+the simulator's exhaustive write/flush-boundary tests.

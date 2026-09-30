@@ -129,3 +129,14 @@ mounts and confirmed complete images remained unchanged.
 open-handle lifetimes, permissions, locking, and remount checks. The earlier
 exit-77 results above record the initial restricted environment; the FUSE
 prerequisite is now satisfied for this run. No physical-device test was run.
+
+
+### Hardware COW trial harness — 2026-09-30
+
+Added `trial cow` to full USB acceptance, recovery, and completion reporting.
+The trial performs full and unaligned overwrites of existing files and rejects
+torn blocks, non-prefix recovery, and loss of acknowledged replacement data.
+All 59 host harness tests passed. Both normal and `--resume` runs of
+`scripts/acceptance-image-smoke.py` passed with COW verification before and after
+FUSE remount. These validate the new harness on images; the new physical COW
+unplug trial has not yet been run.

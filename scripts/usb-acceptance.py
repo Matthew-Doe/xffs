@@ -22,6 +22,7 @@ import uuid
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / 'target/debug'
 SERIAL = '0085199340190280'
+TRIALS = ['create', 'replace', 'cleanup', 'cow']
 
 
 def run(args, **kwargs):
@@ -278,7 +279,33 @@ def payload(kind, n, version='new'):
     return (unit * (65536 // len(unit) + 1))[:65536]
 
 
-def trial_worker(mount, report, kind):
+def cow_versions(n):
+    # Alternate full-block and unaligned partial-block updates across three
+    # blocks. Patterns identify the file/version and preserve untouched bytes.
+    old = hashlib.shake_256(f'XFFS cow {n}'.encode()).digest(3 * 4096)
+    offset = 0 if n % 2 == 0 else 137
+    length = 3 * 4096 if n % 2 == 0 else 8192
+    replacement = bytes(b ^ 255 for b in old[offset:offset + length])
+    new = old[:offset] + replacement + old[offset + len(replacement):]
+    return old, new, offset, replacement
+
+
+def verify_cow(actual, n, phase, overwriting):
+    old, new, _, _ = cow_versions(n)
+    if phase == 'done':
+        assert actual == new, f'acknowledged COW overwrite lost: {n}'
+    elif overwriting:
+        assert phase == 'old', f'COW overwrite without durable old data: {n}'
+        # A multi-block request may publish only a prefix of block replacements.
+        assert actual in [new[:cut] + old[cut:] for cut in range(0, len(old) + 1, 4096)], (
+            f'torn or non-prefix COW overwrite: {n}')
+    elif phase == 'old':
+        assert actual == old, f'acknowledged COW initialization lost: {n}'
+    else:
+        assert actual is None or old.startswith(actual), f'invalid COW initialization: {n}'
+
+
+def trial_worker(mount, report, kind, iterations=None):
     folder = mount / ('trial-' + kind)
     folder.mkdir()
     sync_dir(mount)
@@ -286,12 +313,12 @@ def trial_worker(mount, report, kind):
     # Exclusive creation prevents accidental reuse of trial evidence.
     with log.open('x'):
         pass
-    for n in range(100000):
+    for n in range(100000 if iterations is None else iterations):
         path = folder / f'{n:06d}'
-        content = payload(kind, n)
+        content = cow_versions(n)[1] if kind == 'cow' else payload(kind, n)
         record(log, {'event': 'intent', 'n': n, 'kind': kind,
                      'sha256': hashlib.sha256(content).hexdigest(), 'bytes': len(content)})
-        if n == 0:
+        if n == 0 and kind != 'cow':
             save(report / ('ready-' + kind + '.json'), {'ready': True})
         def ack(phase):
             record(log, {'event': 'ack', 'n': n, 'phase': phase})
@@ -303,6 +330,25 @@ def trial_worker(mount, report, kind):
                     f.flush()
                     os.fsync(f.fileno())
                 sync_dir(folder)
+                ack('done')
+            elif kind == 'cow':
+                old, _, offset, replacement = cow_versions(n)
+                write_sync(path, old)
+                sync_dir(folder)
+                ack('old')
+                # Persist intent before touching existing data. No truncate or rename.
+                record(log, {'event': 'overwrite', 'n': n})
+                if n == 0:
+                    save(report / 'ready-cow.json', {'ready': True})
+                with path.open('r+b', buffering=0) as f:
+                    f.seek(offset)
+                    remaining = memoryview(replacement)
+                    while remaining:
+                        written = f.write(remaining)
+                        if not written:
+                            raise OSError('overwrite made no progress')
+                        remaining = remaining[written:]
+                    os.fsync(f.fileno())
                 ack('done')
             elif kind == 'replace':
                 write_sync(path, payload(kind, n, 'old'))
@@ -328,13 +374,15 @@ def trial_worker(mount, report, kind):
         except OSError as error:
             record(log, {'event': 'interrupted', 'n': n, 'error': str(error)})
             return
-    raise RuntimeError('trial workload exhausted without unplugging')
+    if iterations is None:
+        raise RuntimeError('trial workload exhausted without unplugging')
 
 
 def verify_trial(mount, report, kind):
     events = [json.loads(line) for line in (report / ('trial-' + kind + '.jsonl')).read_text().splitlines()]
     intentions = {e['n']: e for e in events if e['event'] == 'intent'}
     phases = {e['n']: e['phase'] for e in events if e['event'] == 'ack'}
+    overwrites = {e['n'] for e in events if e['event'] == 'overwrite'}
     folder = mount / ('trial-' + kind)
     assert folder.is_dir()
     allowed = set()
@@ -344,7 +392,9 @@ def verify_trial(mount, report, kind):
         content = payload(kind, n)
         phase = phases.get(n)
         actual = path.read_bytes() if path.exists() else None
-        if kind == 'create':
+        if kind == 'cow':
+            verify_cow(actual, n, phase, n in overwrites)
+        elif kind == 'create':
             if phase == 'done':
                 assert actual == content, f'acknowledged create lost: {n}'
             else:
@@ -675,9 +725,9 @@ def main():
     for action in ['workload', 'reconnect', 'verify', 'finish', 'accept', 'recover', 'check', 'resume-workload', 'finalize-report']:
         sub.add_parser(action)
     trial = sub.add_parser('trial')
-    trial.add_argument('kind', choices=['create', 'replace', 'cleanup'])
+    trial.add_argument('kind', choices=TRIALS)
     resume = sub.add_parser('resume-trial')
-    resume.add_argument('kind', choices=['create', 'replace', 'cleanup'])
+    resume.add_argument('kind', choices=TRIALS)
     args = parser.parse_args()
     if args.action == 'accept':
         # Reusable acceptance never invokes formatting. Each child has its own
@@ -686,7 +736,7 @@ def main():
         common = [sys.executable, __file__, '--expect-serial', SERIAL,
                   '--report-dir', args.report_dir]
         for step in [['workload'], ['reconnect'], ['trial', 'create'],
-                     ['trial', 'replace'], ['trial', 'cleanup'], ['finish']]:
+                     ['trial', 'replace'], ['trial', 'cleanup'], ['trial', 'cow'], ['finish']]:
             run(common + step, timeout=620)
         return
     if args.action == 'resume-trial':
@@ -770,7 +820,7 @@ def main():
     else:
         h.check(d, inspect=True)
         # An interrupted trial can be verified/recovered without reformatting.
-        pending = [k for k in ['create', 'replace', 'cleanup']
+        pending = [k for k in TRIALS
                    if (h.report / ('trial-' + k + '.jsonl')).exists()
                    and not (h.report / ('passed-' + k + '.json')).exists()]
         if len(pending) > 1:
@@ -786,7 +836,7 @@ def main():
             save(h.report / ('recovered-' + kind + '.json'), {'recovered': True,
                  'manual_trial_pass': False, 'reason': 'verify-only recovery does not establish observed unplug'})
         if args.action == 'finish':
-            required = ['formatted.json', 'workload.json', 'passed-reconnect.json'] + ['passed-' + k + '.json' for k in ['create', 'replace', 'cleanup']]
+            required = ['formatted.json', 'workload.json', 'passed-reconnect.json'] + ['passed-' + k + '.json' for k in TRIALS]
             missing = [p for p in required if not (h.report / p).exists()]
             save(h.report / 'final.json', {'check_passed': True, 'cleanly_unmounted': True,
                  'acceptance_complete': not missing, 'pending': missing})

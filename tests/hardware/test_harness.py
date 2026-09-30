@@ -72,6 +72,49 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             usb.verify_trial(mount, report, 'create')
 
+class CowTests(unittest.TestCase):
+    def test_every_committed_prefix_and_preserved_partial_bytes(self):
+        for n in [0, 1]:
+            old, new, _, _ = usb.cow_versions(n)
+            for cut in range(0, len(old) + 1, 4096):
+                usb.verify_cow(new[:cut] + old[cut:], n, 'old', True)
+            for cut in [200, 4095, 5000]:
+                with self.assertRaises(AssertionError):
+                    usb.verify_cow(new[:cut] + old[cut:], n, 'old', True)
+            with self.assertRaises(AssertionError):
+                usb.verify_cow(old[:4096] + new[4096:], n, 'old', True)
+            for bad in [None, b'', new[:-1], old]:
+                with self.assertRaises(AssertionError):
+                    usb.verify_cow(bad, n, 'done', True)
+            usb.verify_cow(new, n, 'done', True)
+            usb.verify_cow(old, n, 'old', False)
+            usb.verify_cow(None, n, None, False)
+            usb.verify_cow(old[:100], n, None, False)
+            for bad in [None, old[:-1], new + b'x']:
+                with self.assertRaises(AssertionError):
+                    usb.verify_cow(bad, n, 'old', True)
+            with self.assertRaises(AssertionError):
+                usb.verify_cow(new, n, 'old', False)
+
+    def test_worker_and_verifier_use_existing_file_overwrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount, report = Path(tmp) / 'mount', Path(tmp) / 'report'
+            mount.mkdir()
+            report.mkdir()
+            usb.trial_worker(mount, report, 'cow', iterations=2)
+            usb.verify_trial(mount, report, 'cow')
+            self.assertTrue((report / 'ready-cow.json').exists())
+            events = [json.loads(line) for line in (report / 'trial-cow.jsonl').read_text().splitlines()]
+            self.assertEqual([e['event'] for e in events],
+                             ['intent', 'ack', 'overwrite', 'ack'] * 2)
+            path = mount / 'trial-cow/000001'
+            data = bytearray(path.read_bytes())
+            data[-1] ^= 1
+            path.write_bytes(data)
+            with self.assertRaises(AssertionError):
+                usb.verify_trial(mount, report, 'cow')
+
+
 class ProcessTests(unittest.TestCase):
     def test_worker_output_is_visible(self):
         with tempfile.TemporaryDirectory() as tmp:
