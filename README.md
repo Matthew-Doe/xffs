@@ -17,7 +17,9 @@ There is no promise of stable disk compatibility.
 
 All crates are unpublished, prohibit unsafe code, and require Rust 1.89 or newer.
 Dependencies are recorded in Cargo.lock; Unicode/CRC/FUSE versions are pinned.
-No project license has been selected; release packaging is deferred.
+Licensed under [MIT](LICENSE), copyright 2026 Matthew Doe. See the
+[0.0.1 source release instructions](docs/release-0.0.1.md) and
+[release verification gate](docs/release-verification.md); tagging and publishing remain pending.
 
 ```sh
 cargo build --workspace --locked
