@@ -433,6 +433,13 @@ fn inode_exhaustion_local_directory_edits_and_full_image() {
             .unwrap();
         d.0.borrow_mut().sim.clear_trace();
     }
+    let fragmented = fs.create(ROOT, b"cow-space", false).unwrap();
+    fs.write_file(fragmented, 0, &vec![7; 3 * BLOCK]).unwrap();
+    for logical in [5, 7, 9] {
+        fs.write_file(fragmented, logical * BLOCK as u64, b"x")
+            .unwrap();
+    }
+    let fragmented_before = fs.read_file(fragmented, 0, 10 * BLOCK).unwrap();
     let f = fs.create(ROOT, b"full", false).unwrap();
     let mut offset = 0;
     loop {
@@ -452,6 +459,24 @@ fn inode_exhaustion_local_directory_edits_and_full_image() {
     assert_eq!(d.0.borrow().mutations, 0);
     assert_eq!(fs.read_file(f, 0, BLOCK).unwrap(), vec![5; BLOCK]);
     fs.rename(ROOT, b"full", ROOT, b"FULL", false).unwrap();
+    fs.truncate(f, offset - BLOCK as u64).unwrap();
+    assert_eq!(fs.statfs().unwrap().free_blocks, 1);
+    // Splitting the first extent needs a data block plus a new overflow block.
+    // The separate EOF tail/data update also needs two fresh blocks.
+    for position in [BLOCK as u64, 11 * BLOCK as u64] {
+        d.arm(usize::MAX, false);
+        assert!(matches!(
+            fs.write_file(fragmented, position, b"z"),
+            Err(FsError::NoSpace)
+        ));
+        assert_eq!(d.0.borrow().mutations, 0);
+        assert_eq!(
+            fs.read_file(fragmented, 0, 10 * BLOCK).unwrap(),
+            fragmented_before
+        );
+        assert_eq!(fs.statfs().unwrap().free_blocks, 1);
+    }
+    fs.unlink(ROOT, b"cow-space").unwrap();
     fs.truncate(f, 0).unwrap();
     fs.write_file(f, 3, b"x").unwrap();
     assert_eq!(fs.read_file(f, 0, 4).unwrap(), b"\0\0\0x");
@@ -721,11 +746,19 @@ impl BlockDevice for SparseDevice {
 
 #[test]
 fn oversized_indivisible_mapping_edit_is_rejected_before_io() {
+    mapping_limit_preflight(43000);
+}
+
+#[test]
+fn extent_limit_preflight_keeps_writer_usable() {
+    mapping_limit_preflight(MAX_EXTENTS);
+}
+
+fn mapping_limit_preflight(count: usize) {
     // Sparse backing stores only metadata for a valid 512 MiB, 43,000-extent file.
     // Inserting its first mapping shifts >256 packed overflow blocks, while
     // appending touches only the tail. The first operation must not mutate data.
     let layout = VolumeLayout::new(512 * 1024 * 1024, Some(256)).unwrap();
-    let count = 43000usize;
     let chain_count = (count - 4).div_ceil(EXTENTS_PER_BLOCK);
     let root_block = layout.data_start;
     let data_start = root_block + 1;
@@ -861,6 +894,23 @@ fn oversized_indivisible_mapping_edit_is_rejected_before_io() {
     assert_eq!(d.0.borrow().writes, 0);
     assert_eq!(fs.statfs().unwrap(), before);
     assert_eq!(fs.getattr(file.id).unwrap(), file);
+    if count == MAX_EXTENTS {
+        assert!(matches!(fs.append(file.id, b"x"), Err(FsError::TooBig)));
+        assert_eq!(d.0.borrow().writes, 0);
+        // Replacing an existing last mapping retains the extent count.
+        assert_eq!(
+            fs.write_file(file.id, file.size - BLOCK as u64, b"x")
+                .unwrap(),
+            1
+        );
+        drop(fs);
+        let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
+        assert_eq!(
+            ro.read_file(file.id, file.size - BLOCK as u64, 1).unwrap(),
+            b"x"
+        );
+        return;
+    }
     assert_eq!(fs.append(file.id, b"x").unwrap(), 1);
     drop(fs);
     let mut limited = ReadWriteFs::from_device(
@@ -925,4 +975,161 @@ fn interrupted_cow_overwrite_preserves_old_data() {
     assert_eq!(ro.getattr(id).unwrap().size, 4096);
     let bytes = ro.read_file(id, 0, BLOCK).unwrap();
     assert_eq!(bytes, [1; BLOCK]);
+}
+
+// Fault positions come from the successful operation's write/flush trace, so
+// allocation and extent-chain changes cannot silently escape the crash matrix.
+fn mutation_count(d: &Shared) -> usize {
+    d.0.borrow()
+        .sim
+        .trace()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                xffs_sim::EventKind::Write { .. } | xffs_sim::EventKind::Flush { .. }
+            )
+        })
+        .count()
+}
+
+#[test]
+fn cow_trace_boundaries_prefixes_and_reclamation() {
+    let blank = fixture(FormatRevision::Two, None);
+    for scenario in 0..6 {
+        let setup = Shared::new(&blank);
+        let mut fs = ReadWriteFs::from_device(setup.clone(), OpenOptions::default()).unwrap();
+        let empty_stats = fs.statfs().unwrap();
+        let id = fs.create(ROOT, b"cow", false).unwrap();
+        fs.write_file(id, 0, &vec![1; 3 * BLOCK]).unwrap();
+        if scenario >= 3 {
+            fs.truncate(id, 17).unwrap();
+        }
+        let old = fs.read_file(id, 0, 4 * BLOCK).unwrap();
+        let baseline = setup.0.borrow().sim.durable_bytes().to_vec();
+        let (offset, data) = match scenario {
+            0 => (0, vec![2; BLOCK]),
+            1 => (100, vec![2; 200]),
+            2 => (3000, vec![2; 6000]),
+            3 => (30, vec![2; 40]),
+            4 => (2 * BLOCK as u64 + 10, vec![2; 40]),
+            _ => (0, vec![]),
+        };
+        let mut states = vec![(0, old.clone())];
+        let mut expected = old;
+        let mut completed = 0;
+        if scenario == 5 {
+            expected.resize(3 * BLOCK, 0);
+            states.push((0, expected));
+        } else {
+            while completed < data.len() {
+                let pos = offset as usize + completed;
+                let count = (data.len() - completed).min(BLOCK - pos % BLOCK);
+                expected.resize(expected.len().max(pos + count), 0);
+                expected[pos..pos + count].copy_from_slice(&data[completed..completed + count]);
+                completed += count;
+                states.push((completed, expected.clone()));
+            }
+        }
+        setup.0.borrow_mut().sim.clear_trace();
+        if scenario == 5 {
+            fs.truncate(id, 3 * BLOCK as u64).unwrap();
+        } else {
+            assert_eq!(fs.write_file(id, offset, &data).unwrap(), data.len());
+        }
+        let boundaries = mutation_count(&setup);
+        assert!(boundaries > 0);
+        drop(fs);
+        for prefix in [0, 1, 80, BLOCK / 2, BLOCK - 1, BLOCK] {
+            // Include a no-failure run to require successful writes to survive.
+            for failure in 1..=boundaries + 1 {
+                let d = Shared::new(&baseline);
+                let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                d.arm(failure, prefix != 0);
+                d.0.borrow_mut().tear_at = prefix;
+                let result = if scenario == 5 {
+                    fs.truncate(id, 3 * BLOCK as u64).map(|()| 0)
+                } else {
+                    fs.write_file(id, offset, &data)
+                };
+                drop(fs);
+                d.crash();
+                let mut recovered =
+                    ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                let got = recovered.read_file(id, 0, 4 * BLOCK).unwrap();
+                let state = states
+                    .iter()
+                    .position(|(_, bytes)| *bytes == got)
+                    .unwrap_or_else(|| {
+                        panic!("torn data: scenario {scenario}, failure {failure}, prefix {prefix}")
+                    });
+                if let Ok(n) = result {
+                    assert!(states[state].0 >= n);
+                    if scenario == 5 {
+                        assert_eq!(state, 1);
+                    }
+                }
+                let stats = recovered.statfs().unwrap();
+                drop(recovered);
+                d.crash();
+                let mut recovered =
+                    ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                assert_eq!(recovered.read_file(id, 0, 4 * BLOCK).unwrap(), got);
+                assert_eq!(recovered.statfs().unwrap(), stats);
+                recovered.write_file(id, 0, b"reused").unwrap();
+                recovered.unlink(ROOT, b"cow").unwrap();
+                assert_eq!(recovered.statfs().unwrap(), empty_stats);
+            }
+        }
+    }
+}
+
+#[test]
+fn cow_recovery_can_itself_be_interrupted() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"cow", false).unwrap();
+    fs.write_file(id, 0, &[1; BLOCK]).unwrap();
+    let baseline = d.0.borrow().sim.durable_bytes().to_vec();
+    d.0.borrow_mut().sim.clear_trace();
+    fs.write_file(id, 0, &[2; BLOCK]).unwrap();
+    let boundaries = mutation_count(&d);
+    drop(fs);
+    // Select a crash image with a committed journal awaiting checkpoint/retirement.
+    let mut committed = None;
+    for failure in 1..=boundaries {
+        let d = Shared::new(&baseline);
+        let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+        d.arm(failure, false);
+        let _ = fs.write_file(id, 0, &[2; BLOCK]);
+        drop(fs);
+        d.crash();
+        let bytes = d.0.borrow().sim.durable_bytes().to_vec();
+        let a: Block = bytes[BLOCK..2 * BLOCK].try_into().unwrap();
+        let b: Block = bytes[2 * BLOCK..3 * BLOCK].try_into().unwrap();
+        if select_control(JournalControl::decode(&a, 1), JournalControl::decode(&b, 2))
+            .unwrap()
+            .0
+            .committed
+        {
+            committed = Some(bytes);
+            break;
+        }
+    }
+    let bytes = committed.unwrap();
+    let success = Shared::new(&bytes);
+    let fs = ReadWriteFs::from_device(success.clone(), OpenOptions::default()).unwrap();
+    drop(fs);
+    for failure in 1..=mutation_count(&success) + 1 {
+        for prefix in [0, 80, BLOCK / 2, BLOCK] {
+            let d = Shared::new(&bytes);
+            d.arm(failure, prefix != 0);
+            d.0.borrow_mut().tear_at = prefix;
+            let _ = ReadWriteFs::from_device(d.clone(), OpenOptions::default());
+            d.crash();
+            let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+            assert_eq!(fs.read_file(id, 0, BLOCK).unwrap(), [2; BLOCK]);
+            fs.write_file(id, 0, &[3; BLOCK]).unwrap();
+        }
+    }
 }
