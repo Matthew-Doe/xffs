@@ -1,6 +1,7 @@
-# XFFS 0.0.1 experimental source release candidate
+# XFFS 0.0.1 experimental source release
 
-Release status: **validated source candidate; not tagged or published**. Licensed under
+Release: **0.0.1 experimental source release**, tag `v0.0.1`.
+See [the GitHub release](https://github.com/Matthew-Doe/xffs/releases/tag/v0.0.1). Licensed under
 [MIT](../LICENSE), copyright 2026 Matthew Doe. Crates retain `publish = false`.
 
 New filesystems use experimental format revision 2. Revision 1 is read-only;
