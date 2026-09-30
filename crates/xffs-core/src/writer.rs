@@ -361,6 +361,35 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         }
         node.extents = extents;
     }
+    /// Replace one logical block, retaining both sides of its previous extent.
+    fn replace_block(node: &mut Node, logical: u64, physical: u64) {
+        let mut extents = Vec::with_capacity(node.extents.len() + 2);
+        for e in &node.extents {
+            if logical < e.logical || logical >= e.logical + e.length {
+                extents.push(*e);
+                continue;
+            }
+            let left = logical - e.logical;
+            if left != 0 {
+                extents.push(Extent { length: left, ..*e });
+            }
+            let right = e.length - left - 1;
+            if right != 0 {
+                extents.push(Extent {
+                    logical: logical + 1,
+                    physical: e.physical + left + 1,
+                    length: right,
+                });
+            }
+        }
+        extents.push(Extent {
+            logical,
+            physical,
+            length: 1,
+        });
+        node.extents = extents;
+        Self::coalesce(node);
+    }
     fn stage_node(&mut self, edit: &mut Edit, mut node: Node) -> Result<()> {
         if node.inode.kind == FileKind::Directory && node.inode.state == InodeState::Linked {
             while let Some(e) = node.extents.last_mut() {
@@ -558,11 +587,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             n
         } else {
             let n = self.allocate(&mut edit)?;
-            node.extents.push(Extent {
-                logical,
-                physical: n,
-                length: 1,
-            });
+            Self::replace_block(&mut node, logical, n);
             n
         };
         let mut b = if let Some((_, b)) = edit.data.iter().find(|(p, _)| *p == n) {
@@ -1020,5 +1045,58 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             self.finish_detached(t)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    #[test]
+    fn split_and_rejoin() {
+        let mut fs_node = Node {
+            inode: Inode {
+                id: ROOT,
+                kind: FileKind::File,
+                state: InodeState::Linked,
+                executable: false,
+                size: 0,
+                allocated: 0,
+                parent: ROOT,
+                times: [0; 3],
+                overflow: 0,
+                extent_count: 0,
+                inline: vec![],
+                cleanup_bound: 0,
+                atime: 0,
+            },
+            extents: vec![],
+            entries: vec![],
+        };
+        for logical in [0, 2, 4] {
+            fs_node.extents = vec![Extent {
+                logical: 0,
+                physical: 100,
+                length: 5,
+            }];
+            ReadWriteFs::<ImageDevice>::replace_block(&mut fs_node, logical, 200);
+            for n in 0..5 {
+                assert_eq!(
+                    ReadWriteFs::<ImageDevice>::physical(&fs_node, n),
+                    Some(if n == logical { 200 } else { 100 + n })
+                );
+            }
+            ReadWriteFs::<ImageDevice>::replace_block(&mut fs_node, logical, 100 + logical);
+            assert_eq!(fs_node.extents.len(), 1);
+            assert_eq!(fs_node.extents[0].length, 5);
+        }
+        fs_node.extents = (0..MAX_EXTENTS as u64)
+            .map(|n| Extent {
+                logical: n * 2,
+                physical: 100 + n * 2,
+                length: 1,
+            })
+            .collect();
+        ReadWriteFs::<ImageDevice>::replace_block(&mut fs_node, 1, 101);
+        assert_eq!(fs_node.extents.len(), MAX_EXTENTS - 1);
     }
 }
