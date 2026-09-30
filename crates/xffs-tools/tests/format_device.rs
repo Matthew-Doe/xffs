@@ -113,19 +113,40 @@ fn serial_requires_exact_nonempty_match() {
 #[test]
 #[ignore = "requires root and disposable Linux loop devices"]
 fn loop_format_check_and_writable_reopen() {
-    use std::{fs, process::Command};
+    use std::{fs, io::Write, process::Command};
     use xffs_core::{AccessMode, LinuxBlockDevice, ReadWriteFs, format::ROOT};
     for sector in [512, 4096] {
         let image = std::env::temp_dir().join(format!(
             "xffs-format-loop-{}-{sector}.img",
             std::process::id()
         ));
-        fs::File::create_new(&image)
-            .unwrap()
-            .set_len(32 * 1024 * 1024)
-            .unwrap();
-        let output = Command::new("losetup")
-            .args(["--find", "--show", "--sector-size", &sector.to_string()])
+        struct ImageCleanup(std::path::PathBuf);
+        impl Drop for ImageCleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let mut file = fs::File::create_new(&image).unwrap();
+        let _image_cleanup = ImageCleanup(image.clone());
+        file.set_len(32 * 1024 * 1024).unwrap();
+        // Disposable DOS table: one unmounted Linux partition, in logical sectors.
+        let mut mbr = [0u8; 512];
+        mbr[450] = 0x83;
+        mbr[454..458].copy_from_slice(&2048u32.to_le_bytes());
+        mbr[458..462].copy_from_slice(&2048u32.to_le_bytes());
+        mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
+        file.write_all(&mbr).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let output = Command::new("timeout")
+            .args(["30s", "losetup"])
+            .args([
+                "--find",
+                "--show",
+                "--partscan",
+                "--sector-size",
+                &sector.to_string(),
+            ])
             .arg(&image)
             .output()
             .unwrap();
@@ -138,13 +159,17 @@ fn loop_format_check_and_writable_reopen() {
         struct Cleanup(String, std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = Command::new("losetup").args(["-d", &self.0]).status();
+                let _ = Command::new("timeout")
+                    .args(["30s", "losetup"])
+                    .args(["-d", &self.0])
+                    .status();
                 let _ = fs::remove_file(&self.1);
             }
         }
         let _cleanup = Cleanup(path.clone(), image);
         assert!(
-            Command::new("udevadm")
+            Command::new("timeout")
+                .args(["30s", "udevadm"])
                 .args(["settle", "--timeout=15"])
                 .status()
                 .unwrap()
@@ -152,9 +177,23 @@ fn loop_format_check_and_writable_reopen() {
         );
         let mut d = LinuxBlockDevice::open(&path, AccessMode::ReadWrite).unwrap();
         let info = d.info().clone();
+        let sysfs =
+            std::path::PathBuf::from(format!("/sys/dev/block/{}:{}", info.major, info.minor));
+        let children = || {
+            fs::read_dir(&sysfs)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().path().join("partition").exists())
+                .count()
+        };
+        assert_eq!(
+            children(),
+            1,
+            "old partition must be visible before formatting"
+        );
         format_empty(&mut d, [8; 16], Some(256), FormatRevision::Two).unwrap();
         drop(d);
         xffs_tools::refresh_partition_view(std::path::Path::new(&path), &info).unwrap();
+        assert_eq!(children(), 0, "stale kernel partition survived formatting");
         let d = LinuxBlockDevice::open(&path, AccessMode::ReadWrite).unwrap();
         let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
         let id = fs.create(ROOT, b"loop.txt", false).unwrap();

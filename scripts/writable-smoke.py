@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real image-file acceptance, including a scripted interactive nano save."""
+import argparse
 import contextlib
 import errno
 import hashlib
@@ -106,17 +107,25 @@ def nano_save(path):
 
 
 def main():
+    global TARGET
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bin-dir', type=Path, help='use prebuilt executables without building')
+    args = parser.parse_args()
+    if args.bin_dir:
+        TARGET = args.bin_dir.resolve()
     def timed_out(_sig, _frame):
         raise TimeoutError('writable smoke test exceeded overall timeout')
     signal.signal(signal.SIGTERM, timed_out)
     required = ['cargo', 'fusermount3', 'nano', 'mkdir', 'touch', 'cat', 'cp', 'mv', 'rm', 'rmdir', 'truncate', 'sh']
-    missing = [name for name in required if not shutil.which(name)]
+    missing = [name for name in required if not shutil.which(name) and (name != 'cargo' or not args.bin_dir)]
     if not Path('/dev/fuse').exists():
         missing.append('/dev/fuse')
     if missing:
         print('UNMET PREREQUISITE: ' + ', '.join(missing), file=sys.stderr)
         return 77
-    subprocess.run(['cargo', 'build', '--workspace', '--locked'], cwd=ROOT, check=True, timeout=120)
+
+    if not args.bin_dir:
+        subprocess.run(['cargo', 'build', '--workspace', '--locked'], cwd=ROOT, check=True, timeout=120)
     with tempfile.TemporaryDirectory(prefix='xffs-writable-smoke-') as temp:
         temp = Path(temp)
         point = temp/'mnt'

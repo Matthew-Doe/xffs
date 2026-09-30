@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Explicit real Linux FUSE integration test. Exit 77 means unmet prerequisite."""
+import argparse
 import errno
 import filecmp
 import os
@@ -23,15 +24,20 @@ def timed_out(_signal, _frame):
     raise TimeoutError("mount smoke test exceeded overall timeout")
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bin-dir', type=Path, help='use prebuilt executables without building')
+    args = parser.parse_args()
     signal.signal(signal.SIGTERM, timed_out)
-    missing = [x for x in ['fusermount3', 'mountpoint', 'cargo'] if not shutil.which(x)]
+    missing = [x for x in ['fusermount3', 'mountpoint', 'cargo'] if not shutil.which(x) and (x != 'cargo' or not args.bin_dir)]
     if not Path('/dev/fuse').exists():
         missing.append('/dev/fuse')
     if missing:
         print('UNMET PREREQUISITE: ' + ', '.join(missing), file=sys.stderr)
         return 77
-    subprocess.run(['cargo', 'build', '--workspace', '--locked'], cwd=ROOT, check=True, timeout=120)
-    target = ROOT / 'target' / 'debug'
+
+    if not args.bin_dir:
+        subprocess.run(['cargo', 'build', '--workspace', '--locked'], cwd=ROOT, check=True, timeout=120)
+    target = args.bin_dir.resolve() if args.bin_dir else ROOT / 'target' / 'debug'
     with tempfile.TemporaryDirectory(prefix='xffs-mount-smoke-') as tmp:
         tmp = Path(tmp)
         mountpoint = tmp / 'mnt'

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Explicit root-only disposable loop/FUSE tests. Never selects physical disks."""
+import argparse
 import hashlib
 import os
 from pathlib import Path
@@ -60,6 +61,12 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--workload':
         workload(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == 'rw')
         return 0
+    global BIN
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bin-dir', type=Path, help='use prebuilt executables without building')
+    args = parser.parse_args()
+    if args.bin_dir:
+        BIN = args.bin_dir.resolve()
     if os.geteuid() != 0 or not Path('/dev/fuse').exists():
         print('UNMET PREREQUISITE: run through sudo with /dev/fuse available')
         return 77
@@ -76,10 +83,10 @@ def main():
             os.chown(mount, uid, gid)
             image = tmp / 'disk.img'
             run([BIN / 'mkfs-xffs', image, '--size-mib', '32', '--uuid', '58464653-0000-0001-8000-000000000001'])
-            device = run(['losetup', '--find', '--show', '--sector-size', sector, image], capture_output=True, text=True).stdout.strip()
+            device = run(['losetup', '--find', '--show', '--partscan', '--sector-size', sector, image], capture_output=True, text=True).stdout.strip()
             try:
                 run(['udevadm', 'settle', '--timeout=15'])
-                for mode in ['ro', 'rw', 'ro']:
+                for iteration, mode in enumerate(['ro', 'rw', 'ro']):
                     before = hashlib.sha256(image.read_bytes()).hexdigest()
                     with (tmp / 'service.log').open('w+') as log:
                         command = [BIN / 'mount-xffs', device, mount, '--device', '--uid', str(uid), '--gid', str(gid)]
@@ -93,6 +100,8 @@ def main():
                                     log.seek(0)
                                     raise RuntimeError(log.read())
                                 time.sleep(.05)
+                            if iteration == 2:
+                                assert (mount / 'retained').read_bytes() == b'reconnect persistence'
                             status = Path(f'/proc/{proc.pid}/status').read_text()
                             fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
                             assert fields['Uid'].split() == [str(uid)] * 4
@@ -102,13 +111,19 @@ def main():
                             assert conflict.returncode != 0 and b'LockContention' in conflict.stderr
                             run([sys.executable, __file__, '--workload', mount, uid, gid, mode], user=uid, group=gid, extra_groups=[])
                         finally:
-                            if mounted(mount):
-                                run(['fusermount3', '-u', mount], user=uid, group=gid, extra_groups=[])
                             try:
-                                proc.wait(timeout=10)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                                proc.wait(timeout=5)
+                                if mounted(mount):
+                                    try:
+                                        run(['fusermount3', '-u', mount], user=uid, group=gid, extra_groups=[])
+                                    finally:
+                                        if mounted(mount):
+                                            run(['fusermount3', '-uz', mount], user=uid, group=gid, extra_groups=[])
+                            finally:
+                                try:
+                                    proc.wait(timeout=10)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                    proc.wait(timeout=5)
                     assert proc.returncode == 0
                     run([BIN / 'xffs-check', device, '--device'])
                     if mode == 'ro':

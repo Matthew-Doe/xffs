@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise USB workload code on a temporary image; NOT a hardware acceptance pass."""
+import argparse
 import importlib.util
 import os
 from pathlib import Path
@@ -12,6 +13,13 @@ ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('usb_acceptance', ROOT / 'scripts/usb-acceptance.py')
 usb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(usb)
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--bin-dir', type=Path)
+parser.add_argument('--resume', action='store_true')
+options = parser.parse_args()
+if options.bin_dir:
+    usb.BIN = options.bin_dir.resolve()
 
 with tempfile.TemporaryDirectory(prefix='xffs-acceptance-image-') as tmp:
     tmp = Path(tmp)
@@ -33,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='xffs-acceptance-image-') as tmp:
                         raise RuntimeError(log.read())
                     time.sleep(.05)
                 mode = 'workload' if writable else 'verify'
-                if '--resume' in sys.argv:
+                if options.resume:
                     if writable:
                         (mount / 'persist').mkdir()
                         usb.write_sync(mount / 'persist/throughput.bin', b'partial evidence')
@@ -44,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix='xffs-acceptance-image-') as tmp:
                     else:
                         mode = 'verify-cold'
                 usb.run(['python3', ROOT / 'scripts/usb-acceptance.py', '_worker', mode, mount, report], timeout=180)
-                if '--resume' in sys.argv:
+                if options.resume:
                     assert (mount / 'persist/throughput.bin').read_bytes() == b'partial evidence'
                     assert (mount / 'acceptance-work/retained').read_bytes() == b'old work'
                     assert (mount / 'test.txt').read_bytes() == b'user file'
