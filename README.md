@@ -1,8 +1,18 @@
 # XFFS
 
-Experimental filesystem POC for images and Linux whole-disk devices, with durable core mutations,
-metadata redo journaling, writable recovery, and a deterministic crash simulator.
-Linux FUSE mounts are read-only by default; `--rw` enables everyday file and
+XFFS is an experimental filesystem intended as an alternative to FAT32 and
+exFAT for USB flash drives and other removable storage. Its goal is straightforward
+file storage with recoverable metadata and explicit durability guarantees when a
+drive is disconnected unexpectedly.
+
+The current implementation runs on Linux through FUSE and supports whole-disk
+flash drives as well as image files for development and testing. It is an early
+proof of concept: it has no native Windows or macOS driver, no stable on-disk
+compatibility promise, and is not yet a general-purpose replacement for FAT32 or
+exFAT. Measured USB write performance and durability limits are documented below.
+
+XFFS provides metadata redo journaling, writable recovery, and a deterministic
+crash simulator. Mounts are read-only by default; `--rw` enables everyday file and
 directory operations, including editor saves and atomic rename/replacement.
 
 Software version is **0.0.1**, an experimental source release. New images use **experimental format revision
@@ -81,9 +91,6 @@ See the [format specification](docs/on-disk-format.md),
 [writable API and mount behavior](docs/writable.md),
 [image tools and fixtures](docs/image-tools.md),
 [read-only validation](docs/read-only.md), and [codecs](docs/codecs.md).
-Historical design records remain in [design-decisions.md](design-decisions.md),
-[filesystem-design-and-development-plan.md](filesystem-design-and-development-plan.md),
-and [filesystem-spec-pain-points-and-0.0.1.md](filesystem-spec-pain-points-and-0.0.1.md).
 
 ### Explicit Linux whole-disk access
 
@@ -142,5 +149,7 @@ requires the separate hardware trials.
 
 The serial-bound destructive USB harness, manual unplug protocol, and evidence
 format are documented in [USB acceptance](docs/usb-acceptance.md). See the
-[latest verification report](docs/hardware-results/2026-09-29.md) for actual passes
-and pending hardware trials; temporary image results are not USB acceptance.
+[latest verification report](docs/hardware-results/2026-09-29.md) for completed hardware acceptance and measured USB performance. The observed
+8 MiB write including fsync averaged 0.137 MiB/s; the buffered read after
+reconnect averaged 205.9 MiB/s. These measure this implementation, not raw media
+bandwidth. Temporary image results are not USB acceptance.

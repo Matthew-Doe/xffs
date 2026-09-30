@@ -3,3 +3,8 @@
 *.image
 __pycache__/
 /usb-evidence-*/
+
+# Local planning records; excluded from future source releases.
+/design-decisions.md
+/filesystem-design-and-development-plan.md
+/filesystem-spec-pain-points-and-0.0.1.md
