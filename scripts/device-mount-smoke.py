@@ -16,8 +16,27 @@ BIN = ROOT / 'target/debug'
 def run(args, **kwargs):
     return subprocess.run([str(x) for x in args], check=True, timeout=45, **kwargs)
 
+def check_device(device, disk_sequence):
+    command = [str(BIN / 'xffs-check'), device, '--device',
+               '--expect-disk-sequence', str(disk_sequence)]
+    deadline = time.monotonic() + 15
+    while True:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=45)
+        busy = result.returncode != 0 and result.stderr.strip() == 'Error: LockContention'
+        if busy and time.monotonic() < deadline:
+            time.sleep(min(.1, max(0, deadline - time.monotonic())))
+            continue
+        print(result.stdout, end='')
+        print(result.stderr, end='', file=sys.stderr)
+        result.check_returncode()
+        return
+
+
 def mounted(path):
-    return subprocess.run(['mountpoint', '-q', str(path)], timeout=5).returncode == 0
+    # Root cannot stat a FUSE mount owned by the dropped user. Read the mount
+    # table instead, so readiness and failure cleanup use the same reliable probe.
+    encoded = str(Path(path).absolute()).replace('\\', r'\134').replace(' ', r'\040').replace('\t', r'\011').replace('\n', r'\012')
+    return any(line.split()[4] == encoded for line in Path('/proc/self/mountinfo').read_text().splitlines())
 
 def workload(path, uid, gid, writable, verify_persistence=False):
     assert path.stat().st_uid == uid
@@ -88,6 +107,7 @@ def main():
             device = run(['losetup', '--find', '--show', '--partscan', '--sector-size', sector, image], capture_output=True, text=True).stdout.strip()
             try:
                 run(['udevadm', 'settle', '--timeout=15'])
+                disk_sequence = int((Path('/sys/class/block') / Path(device).name / 'diskseq').read_text())
                 for iteration, mode in enumerate(['ro', 'rw', 'ro']):
                     before = hashlib.sha256(image.read_bytes()).hexdigest()
                     with (tmp / 'service.log').open('w+') as log:
@@ -125,7 +145,7 @@ def main():
                                     proc.kill()
                                     proc.wait(timeout=5)
                     assert proc.returncode == 0
-                    run([BIN / 'xffs-check', device, '--device'])
+                    check_device(device, disk_sequence)
                     if mode == 'ro':
                         assert hashlib.sha256(image.read_bytes()).hexdigest() == before
                 print(f'PASS: {sector}-byte loop device, ownership, privilege drop, RO hash, RW workload, exclusion')

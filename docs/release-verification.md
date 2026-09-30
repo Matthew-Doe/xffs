@@ -1,6 +1,7 @@
 # Source release verification — 2026-09-29
 
-Status: **pending**. No tag or publication has been made. The historical USB
+Status: **required checks passed; ready for a separate tagging/publishing step**.
+No tag or publication has been made. The historical USB
 [acceptance evidence](hardware-results/2026-09-29.md) is unchanged and complete.
 The historical loop formatter ioctl failure and unreached device FUSE suite are
 not counted as passes: the corrected disposable suites must be run explicitly.
@@ -32,7 +33,7 @@ was invoked by the agent.
 Rust 1.89 checks, fresh archive build/image tests, checksum/content verification
 and temporary-prefix installation/removal are recorded below as they complete.
 
-## Privileged gate
+## Initial privileged gate (resolved below)
 
 User-run command, from the checkout after building release executables:
 
@@ -88,3 +89,60 @@ Python compilation passed after that correction. The final candidate is
 repackaged from the clean record/correction commit; its exact hash and source
 commit are in the archive sidecars. The privileged gate remains pending and no
 historical hardware evidence was modified.
+
+## User-run disposable validation and harness correction
+
+The user ran `python3 scripts/device-validation.py --bin-dir "$PWD/target/release"`.
+All three backend tests passed (capacity change, exclusion, mounted-child refusal).
+The backend mounted-child setup printed an sfdisk reread warning before its
+existing partx fallback; that is distinct from the formatter refresh test.
+The corrected formatter test passed both sector sizes, partition refresh and
+writable reopen. This resolves the historical formatter ioctl verification gap.
+
+The device FUSE suite then failed readiness detection: root's `mountpoint` probe
+could not stat the FUSE mount owned by the dropped user. It timed out and also
+missed the mounted filesystem during cleanup, resulting in a secondary temporary
+directory removal error. This run is a failure, not a FUSE pass.
+The leftover disposable mount was detached with `fusermount3 -uz` as the ordinary
+user; no sudo or physical-device operation was performed by the agent.
+
+Readiness and cleanup now inspect `/proc/self/mountinfo` without statting the
+FUSE mount. Two regression tests cover owner-only access, exact mountpoint
+matching, removal, and mountinfo path escaping; all 21 host Python tests pass.
+Only the device FUSE gate now needs the focused user-run command:
+
+```sh
+sudo python3 scripts/device-mount-smoke.py --bin-dir "$PWD/target/release"
+```
+
+The focused rerun progressed through a successful post-unmount check, then a
+later post-unmount checker failed with `Error: LockContention`. This is retained
+as a second failed run. The harness now retries only that exact pre-open error
+for up to 15 seconds at 100 ms intervals; every attempt passes the loop device's
+captured `--expect-disk-sequence`. Other errors and writable operations are not
+retried. Three new tests cover transient contention, timeout, unchanged identity
+arguments and immediate permanent-error failure. All 24 host Python tests pass.
+The device FUSE result remains pending a subsequent rerun.
+
+
+## Final disposable-device result
+
+The user's final focused run passed both **512-byte and 4096-byte** loop devices.
+For each, all three post-unmount checks succeeded. The initial empty filesystem
+had 7,640 free blocks and 511 free inodes; after the writable workload and its
+read-only remount it retained 7,638 free blocks and 510 free inodes, with matching
+saved contents. Ownership, dropped UID/GID and supplementary groups, exclusive
+claims, writable operations, retained-file persistence, read-only whole-image
+hashes, normal service exits, unmounts and loop detachment all passed.
+
+Together with the preceding backend and formatter passes, this closes the
+privileged release gate. The two intermediate FUSE failures above remain part
+of the record; neither was counted as a pass. All required validation is now
+complete. Cargo metadata also confirms every crate inherits MIT, software 0.0.1,
+Rust 1.89 and `publish = false`. No USB trials were repeated, no existing backups
+or repository mountpoint files were changed, and no tag or publication was made.
+
+The final clean-HEAD archive is regenerated after this record is committed. Its
+SHA-256 and exact source commit are recorded beside it, avoiding a self-referential
+commit hash inside this document. Fresh extraction/build and the two image smoke
+logs accompany the archive as external verification evidence.

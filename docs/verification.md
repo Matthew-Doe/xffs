@@ -1,5 +1,9 @@
 # Writable POC verification
 
+For the completed 0.0.1 source-release checks, see the
+[release verification record](release-verification.md). The historical image
+acceptance record below is retained.
+
 This verification record covers the temporary-image acceptance run on Linux on
 2026-09-28. Physical-device implementation and pending USB acceptance are tracked
 separately in the [device results](hardware-results/2026-09-28.md). USB backups

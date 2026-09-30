@@ -1,6 +1,6 @@
 # XFFS 0.0.1 experimental source release candidate
 
-Release status: **pending validation; not tagged or published**. Licensed under
+Release status: **validated source candidate; not tagged or published**. Licensed under
 [MIT](../LICENSE), copyright 2026 Matthew Doe. Crates retain `publish = false`.
 
 New filesystems use experimental format revision 2. Revision 1 is read-only;
