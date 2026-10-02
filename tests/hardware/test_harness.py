@@ -192,6 +192,7 @@ class CowTests(unittest.TestCase):
                 usb.save(report / 'cow-coverage.json',
                          {'overwrite_interruption_observed': covered})
                 h = mock.Mock(report=report)
+                h.check.return_value = ''
                 h.mount.return_value = contextlib.nullcontext(Path('/unused'))
                 if covered:
                     usb.complete_trial(h, {'diskseq': 8}, 'cow')
@@ -202,6 +203,42 @@ class CowTests(unittest.TestCase):
                     self.assertFalse((report / 'passed-cow.json').exists())
                     self.assertTrue((report / 'recovered-cow.json').exists())
                     self.assertFalse(json.loads((report / 'final.json').read_text())['acceptance_complete'])
+
+    def test_disconnect_close_errors_are_recorded_but_other_errors_propagate(self):
+        for expected, code in [(True, 5), (False, 5), (True, 13)]:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / 'trial.jsonl'
+                handles = [mock.Mock(), mock.Mock()]
+                for handle in handles:
+                    handle.close.side_effect = OSError(code, 'close failed')
+                with mock.patch.object(Path, 'open', side_effect=handles):
+                    # Mock record separately because Path.open is the file opener.
+                    with mock.patch.object(usb, 'record') as record:
+                        if expected and code == 5:
+                            with usb.cow_handles(Path(tmp), log, [expected]):
+                                pass
+                            self.assertEqual(record.call_count, 2)
+                        else:
+                            with self.assertRaises(OSError):
+                                with usb.cow_handles(Path(tmp), log, [expected]):
+                                    pass
+                for handle in handles:
+                    handle.close.assert_called_once()
+
+    def test_journal_phase_does_not_claim_torn_data_coverage(self):
+        for first, second, phase in [
+            ((11, False), (10, True), 'journal-retirement'),
+            ((10, True), (10, True), 'committed-journal'),
+            ((9, False), (10, True), 'journal-publication'),
+            ((11, False), (11, False), 'clean-journal'),
+        ]:
+            text = '\n'.join(
+                f'HOME control {n}: Ok(JournalControl {{ sequence: {seq}, committed: {str(state).lower()},'
+                for n, (seq, state) in enumerate([first, second], 1))
+            result = usb.cow_journal_observation(text)
+            self.assertEqual(result['phase'], phase)
+            self.assertFalse(result['data_block_write_interruption_proven'])
+        self.assertEqual(usb.cow_journal_observation('corrupt')['phase'], 'unknown')
 
     def test_retry_preserves_evidence_and_excludes_old_removal(self):
         mount, report, folder, events = self.repeated_case()

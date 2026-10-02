@@ -9,7 +9,7 @@ The harness passes `--expect-serial` and `--expect-disk-sequence` to checker,
 inspector and mount commands; they compare expectations against the claimed
 descriptor before recovery, closing the discovery-to-open hotplug race.
 
-Software remains 0.0.1, experimental format revision 2. The formatter uses
+Software is the 0.0.2 candidate, experimental format revision 2. The formatter uses
 65,536 inodes. No backups are made or changed. Existing repository `mnt/` files
 are never used. Data elsewhere on the disk is not securely erased.
 
@@ -274,3 +274,22 @@ New acceptance completion requires a qualifying COW coverage report as well as
 `passed-cow.json`. Legacy trial receipts remain historical evidence and do not
 satisfy this stronger requirement. Interrupted trials retain the existing
 `verify` / `resume-trial cow` workflow.
+
+
+## Interpreting COW interruption reports
+
+The scope of `cow-coverage.json` is an **application write**. A write call includes
+fresh data writes, journal publication, checkpointing, and journal retirement.
+Its EIO alone does not identify which phase failed, and
+`data_block_write_interruption_proven` remains false.
+
+`cow-recovery.json` records the journal-control state from raw inspection before
+recovery. A newer clean control paired with the preceding committed control is
+reported as `journal-retirement`. Other states are labeled committed, clean,
+publication, or unknown; none independently proves a torn physical data write.
+These are observed durable states, not an exact trace of the failed backend call.
+
+After a recorded device-related write/fsync interruption, expected EIO/ENODEV/ENXIO
+while closing the files is retained as `cow-close-error` evidence. Both handles
+are closed; unrelated errors still propagate. This avoids secondary misleading
+tracebacks without treating unexpected failures as successes.

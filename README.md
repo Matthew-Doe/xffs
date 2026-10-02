@@ -15,7 +15,7 @@ XFFS provides metadata redo journaling, writable recovery, and a deterministic
 crash simulator. Mounts are read-only by default; `--rw` enables everyday file and
 directory operations, including editor saves and atomic rename/replacement.
 
-Software version is **0.0.1**, an experimental source release. New images use **experimental format revision
+Software version is **0.0.2**, an experimental COW source-release candidate. New images use **experimental format revision
 2**. Revision 1 images remain readable but cannot be written or automatically
 converted. These identifiers describe disk encodings, not software releases.
 There is no promise of stable disk compatibility.
@@ -28,8 +28,8 @@ There is no promise of stable disk compatibility.
 All crates are unpublished, prohibit unsafe code, and require Rust 1.89 or newer.
 Dependencies are recorded in Cargo.lock; Unicode/CRC/FUSE versions are pinned.
 Licensed under [MIT](LICENSE), copyright 2026 Matthew Doe. See the
-[0.0.1 source release instructions](docs/release-0.0.1.md) and
-[release verification record](docs/release-verification.md). Releases are available
+[0.0.2 candidate instructions](docs/release-0.0.2.md) and
+[candidate verification record](docs/release-verification-0.0.2.md). The earlier 0.0.1 release is available
 on [GitHub](https://github.com/Matthew-Doe/xffs/releases).
 
 ```sh
@@ -105,7 +105,7 @@ See the [format specification](docs/on-disk-format.md),
 
 Image commands remain the default. Physical devices require `--device`; only
 whole disks with 512-byte or 4096-byte logical sectors are supported. The format
-is still experimental revision 2, software version 0.0.1.
+is still experimental revision 2, software version 0.0.2 (candidate).
 
 ```sh
 sudo target/debug/mkfs-xffs /dev/disk/by-id/YOUR-USB --device --erase \
@@ -158,7 +158,7 @@ requires the separate hardware trials.
 
 The serial-bound destructive USB harness, manual unplug protocol, and evidence
 format are documented in [USB acceptance](docs/usb-acceptance.md). See the
-[latest verification report](docs/hardware-results/2026-09-29.md) for completed hardware acceptance and measured USB performance. The observed
+[latest verification report](docs/hardware-results/2026-10-01.md) for completed hardware acceptance and measured USB performance. The observed
 8 MiB write including fsync averaged 0.137 MiB/s; the buffered read after
 reconnect averaged 205.9 MiB/s. These measure this implementation, not raw media
 bandwidth. Temporary image results are not USB acceptance.

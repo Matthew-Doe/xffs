@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -21,7 +22,8 @@ def main():
     if git('status', '--porcelain', '--untracked-files=no').strip():
         parser.error('tracked tree must be clean, including the index')
     commit = git('rev-parse', 'HEAD').decode().strip()
-    name = 'xffs-0.0.1'
+    manifest = tomllib.loads((ROOT / 'Cargo.toml').read_text())
+    name = 'xffs-' + manifest['workspace']['package']['version']
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     archive = out / (name + '.tar.gz')

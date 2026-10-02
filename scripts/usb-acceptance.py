@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -317,6 +318,48 @@ def cow_state(slot, generation):
     return base[:offset] + data + base[offset + len(data):]
 
 
+@contextmanager
+def cow_handles(folder, log, interrupted):
+    handles = []
+    try:
+        for slot in range(2):
+            handles.append((folder / f'{slot:06d}').open('r+b', buffering=0))
+        yield handles
+    finally:
+        unexpected = None
+        for slot, handle in enumerate(handles):
+            try:
+                handle.close()
+            except OSError as error:
+                if interrupted[0] and error.errno in (errno.EIO, errno.ENODEV, errno.ENXIO):
+                    record(log, {'event': 'cow-close-error', 'slot': slot,
+                                 'errno': error.errno, 'error': str(error)})
+                elif unexpected is None:
+                    unexpected = error
+        if unexpected is not None:
+            raise unexpected
+
+
+def cow_journal_observation(text):
+    controls = re.findall(
+        r'HOME control ([12]): Ok\(JournalControl \{ sequence: (\d+), committed: (true|false),',
+        text)
+    result = {'phase': 'unknown', 'data_block_write_interruption_proven': False}
+    if len(controls) != 2 or {c[0] for c in controls} != {'1', '2'}:
+        return result
+    ordered = sorted((int(seq), state == 'true') for _, seq, state in controls)
+    if ordered[1][0] == ordered[0][0] + 1 and ordered[0][1] and not ordered[1][1]:
+        result['phase'] = 'journal-retirement'
+    elif ordered[0] == ordered[1] and ordered[0][1]:
+        result['phase'] = 'committed-journal'
+    elif ordered[0] == ordered[1] and not ordered[0][1]:
+        result['phase'] = 'clean-journal'
+    elif ordered[1][0] == ordered[0][0] + 1 and not ordered[0][1] and ordered[1][1]:
+        result['phase'] = 'journal-publication'
+    result['controls'] = [{'sequence': seq, 'committed': committed} for seq, committed in ordered]
+    return result
+
+
 def cow_worker(mount, report, iterations=None):
     # A unique folder allows evidence-preserving retries without changing the
     # previous attempt's files, which are now part of the baseline manifest.
@@ -333,8 +376,8 @@ def cow_worker(mount, report, iterations=None):
         sync_dir(folder)
         record(log, {'event': 'initialized', 'slot': slot})
     # No creation, truncation, or rename occurs after readiness.
-    with (folder / '000000').open('r+b', buffering=0) as full, (
-            folder / '000001').open('r+b', buffering=0) as partial:
+    interrupted = [False]
+    with cow_handles(folder, log, interrupted) as (full, partial):
         for n in range(100000 if iterations is None else iterations):
             slot, generation = n % 2, n // 2 + 1
             _, _, offset, replacement = cow_versions(slot)
@@ -360,6 +403,7 @@ def cow_worker(mount, report, iterations=None):
                 os.fsync(f.fileno())
                 record(log, {'event': 'cow-ack', 'n': n})
             except OSError as error:
+                interrupted[0] = error.errno in (errno.EIO, errno.ENODEV, errno.ENXIO)
                 record(log, {'event': 'cow-interrupted', 'n': n,
                              'stage': stage, 'error': str(error)})
                 return
@@ -412,6 +456,9 @@ def verify_cow_repeated(mount, events):
             assert event['stage'] in ('write', 'fsync')
             assert (event['stage'] == 'fsync') == returned
             interrupted_write = event['stage'] == 'write'
+        elif kind == 'cow-close-error':
+            assert pending and event['slot'] in (0, 1)
+            assert event['errno'] in (errno.EIO, errno.ENODEV, errno.ENXIO)
         else:
             raise AssertionError('unknown COW evidence event')
     allowed = {f'{slot:06d}' for slot in initializing}
@@ -434,6 +481,8 @@ def verify_cow_repeated(mount, events):
             assert actual == old, 'acknowledged COW data lost'
     return {
         'version': 2, 'data_valid': True,
+        'interruption_scope': 'application-write',
+        'data_block_write_interruption_proven': False,
         'acknowledged_overwrites': count - int(pending is not None),
         'unacknowledged_overwrite': pending is not None,
         'write_error_observed': interrupted_write,
@@ -456,7 +505,7 @@ def archive_cow_attempt(report):
     archive = report / ('cow-history-' + uuid.uuid4().hex)
     archive.mkdir()
     for name in ('trial-cow.jsonl', 'ready-cow.json', 'passed-cow.json',
-                 'recovered-cow.json', 'cow-coverage.json', 'final.json'):
+                 'recovered-cow.json', 'cow-coverage.json', 'cow-recovery.json', 'final.json'):
         path = report / name
         if path.exists():
             path.rename(archive / name)
@@ -684,9 +733,11 @@ class Harness:
         return ['--expect-serial', SERIAL, '--expect-disk-sequence', str(d['diskseq'])]
 
     def check(self, d, inspect=False):
+        inspection = None
         if inspect:
-            self.command([BIN / 'xffs-inspect', d['path'], '--device'] + self.identity_args(d), 'raw-inspect', required=False, retry_lock=True)
+            inspection = self.command([BIN / 'xffs-inspect', d['path'], '--device'] + self.identity_args(d), 'raw-inspect', required=False, retry_lock=True)
         self.command([BIN / 'xffs-check', d['path'], '--device', '--memory-mib', '512'] + self.identity_args(d), 'check', retry_lock=True)
+        return inspection.stdout if inspection and inspection.returncode == 0 else ''
 
     def worker(self, mode, mount, kind=None, wait=True):
         args = [sys.executable, '-u', __file__, '_worker', mode, str(mount), str(self.report)]
@@ -805,7 +856,9 @@ def observed_removal(report, kind):
 
 
 def complete_trial(h, d, kind):
-    h.check(d, inspect=True)
+    inspection = h.check(d, inspect=True)
+    if kind == 'cow':
+        save(h.report / 'cow-recovery.json', cow_journal_observation(inspection))
     h.readonly(d, trial=kind)
     with h.mount(d, writable=True) as mount:
         h.worker('verify-trial', mount, kind)

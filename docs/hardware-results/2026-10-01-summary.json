@@ -1,0 +1,80 @@
+{
+  "cow-coverage.json": {
+    "acknowledged_overwrites": 9,
+    "data_valid": true,
+    "overwrite_interruption_observed": true,
+    "recovered_outcome": "new",
+    "unacknowledged_overwrite": true,
+    "version": 2,
+    "write_error_observed": true
+  },
+  "evidence_sha256": {
+    "1790907529863695898-worker.log": "e4f8320e555bbb9835414e0c2aa7c4084f8b7fb0c780480fb36660777c0fe9af",
+    "1790907557854720151-raw-inspect.log": "1c64d09287b0109a3317aeeec83d17ffde263cd3b477e05ffced173a60185211",
+    "cow-coverage.json": "9c90c4a1c4a7cccb11621b27ea7919df2593206fec23989135aab1aff61962e1",
+    "final.json": "ca315289380d820a1c324b9826afdae9230c7b5089a7ae305cde246048b91120",
+    "passed-cleanup.json": "b2a343cd8b4c7f9862fbcb610eedd5c45d262999811d32f8ed41cd63839c6594",
+    "passed-cow.json": "1373f55afc9632cc844d34846b31ab696c6d2fbe577eb68bce1bf953590e7f65",
+    "passed-create.json": "fcfae931ba31bdf0cc9b034d48b72ae44f6d59d65f984e65079d12bf2b3172cb",
+    "passed-reconnect.json": "c25183da8f5754a9f329fa48200d919023b05cb7d07c3207cb547c9221e35323",
+    "passed-replace.json": "602b459517705809b9eb9a77a257da75114d4ffafcf0c7df3cd7c0768e452849",
+    "performance.json": "0ed8b52085c095172b64ad2c413d17d14e47c35f77675067ad6dfce71d1535d9",
+    "trial-cow.jsonl": "4ecabeb5fe5210c9abb5196c40c66c43bf2eafca907b4ffa1e2c3b7ae3e22bd9",
+    "workload.json": "e899c1476320c4c7025bd3c1ef8dee8f7a5fbe25be431e3c473b74c3fefefd4a"
+  },
+  "final.json": {
+    "acceptance_complete": true,
+    "check_passed": true,
+    "cleanly_unmounted": true,
+    "pending": []
+  },
+  "interpretation": {
+    "application_write_interrupted": true,
+    "data_block_write_interruption_proven": false,
+    "journal_controls": [
+      {
+        "committed": false,
+        "sequence": 5281
+      },
+      {
+        "committed": true,
+        "sequence": 5280
+      }
+    ],
+    "recovery_phase": "journal-retirement"
+  },
+  "passed-cleanup.json": {
+    "diskseq": 27,
+    "passed": true
+  },
+  "passed-cow.json": {
+    "diskseq": 6,
+    "passed": true
+  },
+  "passed-create.json": {
+    "diskseq": 24,
+    "passed": true
+  },
+  "passed-reconnect.json": {
+    "diskseq": 23,
+    "passed": true
+  },
+  "passed-replace.json": {
+    "diskseq": 25,
+    "passed": true
+  },
+  "performance.json": {
+    "bytes": 8388608,
+    "path": "persist/throughput.bin",
+    "reconnected_read_mib_s": 198.29564890071643,
+    "reconnected_read_seconds": 0.040343799999391194,
+    "scope": "USB + buffered Linux backend + FUSE + transaction flushes; not raw media bandwidth",
+    "write_fsync_mib_s": 0.15585841167363998,
+    "write_fsync_seconds": 51.32863805099987
+  },
+  "workload.json": {
+    "free_space_restored": true,
+    "nano": "real PTY save",
+    "passed": true
+  }
+}

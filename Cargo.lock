@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "xffs-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "caseless",
  "crc32c",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "xffs-fuse"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "fuser",
@@ -717,14 +717,14 @@ dependencies = [
 
 [[package]]
 name = "xffs-sim"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "xffs-core",
 ]
 
 [[package]]
 name = "xffs-tools"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "crc32c",
