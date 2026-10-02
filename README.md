@@ -167,3 +167,6 @@ For reproducible XFFS/exFAT/FAT32/ext4 comparisons, see
 [filesystem benchmarking](docs/benchmarking.md). The separate benchmark harness
 supports disposable loop images, explicitly authorized whole-USB-disk runs,
 and offline report regeneration from saved results.
+
+For measured write-path timing and the non-formatting USB profiler, see
+[write profiling](docs/profiling.md).

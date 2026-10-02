@@ -147,6 +147,7 @@ pub mod names;
 pub mod reader;
 pub use reader::ReadOnlyFs;
 
+pub mod profile;
 pub mod writer;
 pub use writer::ReadWriteFs;
 

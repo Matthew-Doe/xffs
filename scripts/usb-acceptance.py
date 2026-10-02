@@ -755,7 +755,7 @@ class Harness:
             stop_worker(proc)
 
     @contextmanager
-    def mount(self, d, writable=False, abrupt=False):
+    def mount(self, d, writable=False, abrupt=False, profile_json=None):
         tmp = Path(tempfile.mkdtemp(prefix='xffs-usb-mount-'))
         try:
             os.chown(tmp, self.uid, self.gid)
@@ -766,6 +766,8 @@ class Harness:
                     '--uid', str(self.uid), '--gid', str(self.gid)] + self.identity_args(d)
             if writable:
                 args.append('--rw')
+            if profile_json is not None:
+                args.extend(['--profile-json', str(profile_json)])
             with (self.report / (str(time.time_ns()) + '-mount.log')).open('w') as log:
                 proc = subprocess.Popen(args, stdout=log, stderr=log, start_new_session=True)
                 progress('Opening filesystem and completing recovery before mount...')

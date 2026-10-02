@@ -9,3 +9,6 @@ __pycache__/
 /design-decisions.md
 /filesystem-design-and-development-plan.md
 /filesystem-spec-pain-points-and-0.0.1.md
+
+# Host evidence from non-formatting USB profiling runs.
+/profile-usb-*/

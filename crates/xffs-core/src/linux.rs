@@ -28,6 +28,7 @@ pub struct LinuxBlockDevice {
     sysfs: PathBuf,
     info: DeviceInfo,
     access: AccessMode,
+    profile: Option<crate::profile::Profiler>,
 }
 fn metadata_error(e: std::io::Error) -> DeviceError {
     io_error(Operation::Metadata, None, None, e)
@@ -243,6 +244,7 @@ impl LinuxBlockDevice {
             sysfs,
             info,
             access,
+            profile: None,
         })
     }
     pub fn info(&self) -> &DeviceInfo {
@@ -262,7 +264,11 @@ impl LinuxBlockDevice {
         }
         Ok(())
     }
+    pub fn set_profiler(&mut self, profile: crate::profile::Profiler) {
+        self.profile = Some(profile);
+    }
     pub fn verify_identity(&mut self) -> Result<(), DeviceError> {
+        let _timer = crate::profile::span(&self.profile, "linux/identity");
         if !self.sysfs.exists() {
             return Err(DeviceError::DeviceRemoved);
         }
@@ -307,6 +313,7 @@ impl BlockDevice for LinuxBlockDevice {
         if self.access == AccessMode::ReadOnly {
             return Ok(());
         }
+        let _timer = crate::profile::span(&self.profile, "linux/sync_all");
         retry(|| self.file.sync_all()).map_err(|e| io_error(Operation::Flush, None, None, e))
     }
 }
@@ -342,6 +349,7 @@ mod tests {
             file,
             sysfs: dir.clone(),
             access: AccessMode::ReadWrite,
+            profile: None,
             info: DeviceInfo {
                 capacity: 4096,
                 logical_sector: 512,

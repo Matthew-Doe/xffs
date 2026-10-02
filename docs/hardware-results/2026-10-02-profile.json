@@ -1,0 +1,379 @@
+{
+  "cleanup": {
+    "free_space_restored": true,
+    "passed": true
+  },
+  "create": {
+    "timings": {
+      "backend/flush": {
+        "attempted_bytes": 0,
+        "count": 14403,
+        "errors": 0,
+        "max_ns": 794180073,
+        "p50_upper_ns": 2097151,
+        "p95_upper_ns": 8388607,
+        "total_ns": 65818304089
+      },
+      "backend/read": {
+        "attempted_bytes": 42463232,
+        "count": 8351,
+        "errors": 0,
+        "max_ns": 333544,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 240142515
+      },
+      "backend/write": {
+        "attempted_bytes": 117817344,
+        "count": 28764,
+        "errors": 0,
+        "max_ns": 147637,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 896167462
+      },
+      "commit/checkpoint_flush": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 779031902,
+        "p50_upper_ns": 8388607,
+        "p95_upper_ns": 8388607,
+        "total_ns": 21663826706
+      },
+      "commit/checkpoint_write": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 215605,
+        "p50_upper_ns": 131071,
+        "p95_upper_ns": 131071,
+        "total_ns": 196539590
+      },
+      "commit/data_flush": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 639213040,
+        "p50_upper_ns": 2097151,
+        "p95_upper_ns": 2097151,
+        "total_ns": 7684655573
+      },
+      "commit/data_write": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 88148,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 64501134
+      },
+      "commit/journal_flush": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 794001,
+        "p50_upper_ns": 1048575,
+        "p95_upper_ns": 1048575,
+        "total_ns": 1370211268
+      },
+      "commit/journal_write": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 293411,
+        "p50_upper_ns": 262143,
+        "p95_upper_ns": 262143,
+        "total_ns": 352920029
+      },
+      "commit/preflight": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 39604,
+        "p50_upper_ns": 16383,
+        "p95_upper_ns": 32767,
+        "total_ns": 29082880
+      },
+      "commit/publish": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 796087778,
+        "p50_upper_ns": 8388607,
+        "p95_upper_ns": 8388607,
+        "total_ns": 20356717107
+      },
+      "commit/retire": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 665394424,
+        "p50_upper_ns": 4194303,
+        "p95_upper_ns": 4194303,
+        "total_ns": 15069647262
+      },
+      "commit/total": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 807660346,
+        "p50_upper_ns": 16777215,
+        "p95_upper_ns": 16777215,
+        "total_ns": 66792354696
+      },
+      "linux/identity": {
+        "attempted_bytes": 0,
+        "count": 51518,
+        "errors": 0,
+        "max_ns": 130445,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 1400415092
+      },
+      "linux/sync_all": {
+        "attempted_bytes": 0,
+        "count": 14403,
+        "errors": 0,
+        "max_ns": 794156788,
+        "p50_upper_ns": 2097151,
+        "p95_upper_ns": 8388607,
+        "total_ns": 65441839100
+      },
+      "request/write": {
+        "attempted_bytes": 8388608,
+        "count": 16,
+        "errors": 0,
+        "max_ns": 19080725881,
+        "p50_upper_ns": 536870911,
+        "p95_upper_ns": 34359738367,
+        "total_ns": 67064091483
+      },
+      "staging/allocate": {
+        "attempted_bytes": 0,
+        "count": 2057,
+        "errors": 0,
+        "max_ns": 2565,
+        "p50_upper_ns": 127,
+        "p95_upper_ns": 255,
+        "total_ns": 162455
+      },
+      "staging/metadata": {
+        "attempted_bytes": 0,
+        "count": 2058,
+        "errors": 0,
+        "max_ns": 198253,
+        "p50_upper_ns": 131071,
+        "p95_upper_ns": 262143,
+        "total_ns": 213637225
+      }
+    },
+    "workload": {
+      "bytes": 8388608,
+      "free_blocks": 30417382,
+      "free_inodes": 65499,
+      "mib_s": 0.11928515685599449,
+      "verified": true,
+      "write_fsync_seconds": 67.06618166799998
+    }
+  },
+  "evidence_sha256": {
+    "cleanup.json": "dd652dd1bc9c129488c0fa31d075ef608faae85904aeb4a873ed15278f25ec4d",
+    "create-profile.json": "78cbd2254a5479e89e2385512ff164b3b27a24067b2a558a4cfaf27154eb445b",
+    "create-workload.json": "fa04a3940495af313e22823ed43ad52f6d4bc26fba31bd8f8776e1203fc88ddb",
+    "overwrite-profile.json": "c13b482983671e52a0da354b745a4e732cdbc2e746ba451ca06883aaad94b9e1",
+    "overwrite-workload.json": "d108e8c20adbdd483ea9a312c9638e6bea4ddf942b9ab71eb79f659e19e4ccb3"
+  },
+  "overwrite": {
+    "timings": {
+      "backend/flush": {
+        "attempted_bytes": 0,
+        "count": 14396,
+        "errors": 0,
+        "max_ns": 793130757,
+        "p50_upper_ns": 2097151,
+        "p95_upper_ns": 8388607,
+        "total_ns": 50899763915
+      },
+      "backend/read": {
+        "attempted_bytes": 50978816,
+        "count": 10430,
+        "errors": 0,
+        "max_ns": 7770730,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 326099981
+      },
+      "backend/write": {
+        "attempted_bytes": 117886976,
+        "count": 28781,
+        "errors": 0,
+        "max_ns": 82977,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 860817745
+      },
+      "commit/checkpoint_flush": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 772606302,
+        "p50_upper_ns": 8388607,
+        "p95_upper_ns": 8388607,
+        "total_ns": 17024688946
+      },
+      "commit/checkpoint_write": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 163239,
+        "p50_upper_ns": 131071,
+        "p95_upper_ns": 131071,
+        "total_ns": 186217769
+      },
+      "commit/data_flush": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 662864001,
+        "p50_upper_ns": 2097151,
+        "p95_upper_ns": 2097151,
+        "total_ns": 5853409513
+      },
+      "commit/data_write": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 74221,
+        "p50_upper_ns": 65535,
+        "p95_upper_ns": 65535,
+        "total_ns": 62889214
+      },
+      "commit/journal_flush": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 770800,
+        "p50_upper_ns": 1048575,
+        "p95_upper_ns": 1048575,
+        "total_ns": 1368283106
+      },
+      "commit/journal_write": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 263570,
+        "p50_upper_ns": 262143,
+        "p95_upper_ns": 262143,
+        "total_ns": 348539872
+      },
+      "commit/preflight": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 33443,
+        "p50_upper_ns": 16383,
+        "p95_upper_ns": 32767,
+        "total_ns": 28618846
+      },
+      "commit/publish": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 795698679,
+        "p50_upper_ns": 8388607,
+        "p95_upper_ns": 8388607,
+        "total_ns": 15594209552
+      },
+      "commit/retire": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 563713261,
+        "p50_upper_ns": 4194303,
+        "p95_upper_ns": 4194303,
+        "total_ns": 11359370353
+      },
+      "commit/total": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 807194979,
+        "p50_upper_ns": 16777215,
+        "p95_upper_ns": 16777215,
+        "total_ns": 51829068848
+      },
+      "linux/identity": {
+        "attempted_bytes": 0,
+        "count": 53607,
+        "errors": 0,
+        "max_ns": 83929,
+        "p50_upper_ns": 32767,
+        "p95_upper_ns": 65535,
+        "total_ns": 1438221628
+      },
+      "linux/sync_all": {
+        "attempted_bytes": 0,
+        "count": 14396,
+        "errors": 0,
+        "max_ns": 793097955,
+        "p50_upper_ns": 2097151,
+        "p95_upper_ns": 8388607,
+        "total_ns": 50524330163
+      },
+      "request/write": {
+        "attempted_bytes": 8388608,
+        "count": 16,
+        "errors": 0,
+        "max_ns": 13729119602,
+        "p50_upper_ns": 16777215,
+        "p95_upper_ns": 17179869183,
+        "total_ns": 52199015833
+      },
+      "staging/allocate": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 1923,
+        "p50_upper_ns": 127,
+        "p95_upper_ns": 255,
+        "total_ns": 200648
+      },
+      "staging/metadata": {
+        "attempted_bytes": 0,
+        "count": 2056,
+        "errors": 0,
+        "max_ns": 165043,
+        "p50_upper_ns": 131071,
+        "p95_upper_ns": 131071,
+        "total_ns": 203992075
+      }
+    },
+    "workload": {
+      "bytes": 8388608,
+      "free_blocks": 30415333,
+      "free_inodes": 65498,
+      "mib_s": 0.153253812397339,
+      "verified": true,
+      "write_fsync_seconds": 52.200985247000006
+    }
+  },
+  "run": {
+    "device": {
+      "diskseq": 3,
+      "path": "/dev/sdb",
+      "rm": true,
+      "serial": "0085199340190280",
+      "size": 124623257600,
+      "sysfs": "/sys/class/block/sdb",
+      "tran": "usb",
+      "type": "disk"
+    },
+    "mib_per_phase": 8,
+    "mount_binary": "/home/matthewd/devel/xffs/target/release/mount-xffs",
+    "nested_metrics_inclusive": true,
+    "scope": "USB",
+    "startup_excluded": true,
+    "temporary_file": ".xffs-profile-d00846b898b44ed7ad8997ecd4d2654f"
+  }
+}

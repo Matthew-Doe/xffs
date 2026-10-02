@@ -1133,3 +1133,53 @@ fn cow_recovery_can_itself_be_interrupted() {
         }
     }
 }
+
+#[test]
+fn profiling_preserves_io_order_and_errors() {
+    use xffs_core::profile::{ProfiledDevice, Profiler};
+    let bytes = fixture(FormatRevision::Two, None);
+    for fail in [None, Some(1), Some(2), Some(10)] {
+        let mut traces = vec![];
+        let mut outcomes = vec![];
+        for enabled in [false, true] {
+            let d = Shared::new(&bytes);
+            let p = Profiler::default();
+            let device: Box<dyn BlockDevice> = if enabled {
+                Box::new(ProfiledDevice::new(d.clone(), p.clone()))
+            } else {
+                Box::new(d.clone())
+            };
+            let mut fs = ReadWriteFs::from_device(device, OpenOptions::default()).unwrap();
+            let id = fs.create(ROOT, b"profile", false).unwrap();
+            fs.write_file(id, 0, &[1; BLOCK]).unwrap();
+            if enabled {
+                fs.set_profiler(p.clone());
+            }
+            p.clear();
+            d.0.borrow_mut().sim.clear_trace();
+            if let Some(n) = fail {
+                d.arm(n, false);
+            }
+            let result = fs.write_file(id, 17, b"profile");
+            outcomes.push(result.is_ok());
+            traces.push(
+                d.0.borrow()
+                    .sim
+                    .trace()
+                    .iter()
+                    .map(|e| (e.kind.clone(), e.outcome.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            if enabled {
+                let json = p.json();
+                assert!(json.contains("\"request/write\""));
+                assert!(json.contains("\"commit/total\""));
+                if fail.is_some() {
+                    assert!(json.contains("\"errors\":1"));
+                }
+            }
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert_eq!(traces[0], traces[1]);
+    }
+}

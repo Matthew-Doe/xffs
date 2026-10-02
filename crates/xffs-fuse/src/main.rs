@@ -1,10 +1,14 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
+use xffs_core::profile::{ProfiledDevice, Profiler};
 use xffs_core::{AccessMode, BlockDevice, ImageDevice, LinuxBlockDevice, reader::OpenOptions};
 #[derive(Parser)]
 #[command(about = "Mount XFFS in the foreground (read-only by default)")]
 struct Args {
     image: PathBuf,
+    /// Write aggregate inclusive timings to a new host file after unmount.
+    #[arg(long)]
+    profile_json: Option<PathBuf>,
     mountpoint: PathBuf,
     #[arg(long)]
     noexec: bool,
@@ -66,10 +70,14 @@ fn main() -> Result<()> {
     } else {
         AccessMode::ReadOnly
     };
+    let profile = a.profile_json.as_ref().map(|_| Profiler::default());
     // Claim as root, then permanently drop privileges BEFORE recovery reads/writes.
     let device: Box<dyn BlockDevice + Send> = if a.device {
-        let device = LinuxBlockDevice::open(&a.image, access)?;
+        let mut device = LinuxBlockDevice::open(&a.image, access)?;
         device.require_identity(a.expect_serial.as_deref(), a.expect_disk_sequence)?;
+        if let Some(p) = &profile {
+            device.set_profiler(p.clone());
+        }
         eprintln!("Claimed {}: {:?}", a.image.display(), device.info());
         Box::new(device)
     } else {
@@ -86,13 +94,28 @@ fn main() -> Result<()> {
             return Err("privilege drop verification failed".into());
         }
     }
+    // Open after privilege drop and before mounting; never truncate an existing file.
+    let mut profile_file = a
+        .profile_json
+        .as_ref()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        })
+        .transpose()?;
+    let device: Box<dyn BlockDevice + Send> = if let Some(p) = &profile {
+        Box::new(ProfiledDevice::new(device, p.clone()))
+    } else {
+        device
+    };
     let adapter = if a.rw {
-        xffs_fuse::Adapter::new_writable(
-            xffs_core::ReadWriteFs::from_device(device, options)?,
-            uid,
-            gid,
-            a.noexec,
-        )
+        let mut fs = xffs_core::ReadWriteFs::from_device(device, options)?;
+        if let Some(p) = &profile {
+            fs.set_profiler(p.clone());
+        }
+        xffs_fuse::Adapter::new_writable(fs, uid, gid, a.noexec)
     } else {
         let fs = xffs_core::ReadOnlyFs::from_device(device, options)?;
         for d in fs.diagnostics() {
@@ -100,11 +123,18 @@ fn main() -> Result<()> {
         }
         xffs_fuse::Adapter::new(fs, uid, gid, a.noexec)
     };
-    fuser::mount2(
+    if let Some(p) = &profile {
+        p.clear();
+    }
+    let result = fuser::mount2(
         adapter,
         &a.mountpoint,
         &xffs_fuse::mount_config_writable(a.noexec, a.rw),
-    )?;
+    );
+    if let (Some(p), Some(file)) = (&profile, &mut profile_file) {
+        file.write_all(p.json().as_bytes())?;
+    }
+    result?;
     Ok(())
 }
 #[cfg(test)]

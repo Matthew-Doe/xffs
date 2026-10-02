@@ -13,6 +13,7 @@ pub struct ReadWriteFs<D: BlockDevice = ImageDevice> {
     memory_limit: usize,
     next_block: u64,
     opens: BTreeMap<InodeId, u64>,
+    profile: Option<crate::profile::Profiler>,
 }
 impl ReadWriteFs<ImageDevice> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -63,6 +64,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         let mut fs = Self {
             next_block: view.superblock.layout.data_start,
             opens: BTreeMap::new(),
+            profile: None,
             view,
             sequence: control.sequence,
             faulted: false,
@@ -86,6 +88,9 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         }
         fs.resume_cleanup()?;
         Ok(fs)
+    }
+    pub fn set_profiler(&mut self, profile: crate::profile::Profiler) {
+        self.profile = Some(profile);
     }
     fn device(&mut self) -> &mut D {
         &mut self.view.metadata.device.0
@@ -111,6 +116,8 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         images: &BTreeMap<u64, Block>,
         data: &[(u64, Block)],
     ) -> Result<()> {
+        let _commit = crate::profile::span(&self.profile, "commit/total");
+        let preflight = crate::profile::span(&self.profile, "commit/preflight");
         self.healthy()?;
         if images.is_empty() || images.len() > 256 {
             return Err(FsError::TooBig);
@@ -162,28 +169,44 @@ impl<D: BlockDevice> ReadWriteFs<D> {
                 "fresh distinct data target",
             )?;
         }
+        drop(preflight);
         let result = (|| {
+            let timer = crate::profile::span(&self.profile, "commit/data_write");
             for (n, b) in data {
                 self.device().write_at(n * 4096, b)?;
             }
+            drop(timer);
+            let timer = crate::profile::span(&self.profile, "commit/data_flush");
             self.device().flush()?;
+            drop(timer);
+            let timer = crate::profile::span(&self.profile, "commit/journal_write");
             for (ordinal, ((_, image), descriptor)) in images.iter().zip(&payload).enumerate() {
                 self.device()
                     .write_at((3 + 2 * ordinal as u64) * 4096, descriptor)?;
                 self.device()
                     .write_at((4 + 2 * ordinal as u64) * 4096, image)?;
             }
+            drop(timer);
+            let timer = crate::profile::span(&self.profile, "commit/journal_flush");
             self.device().flush()?;
+            drop(timer);
+            let timer = crate::profile::span(&self.profile, "commit/publish");
             self.controls(JournalControl {
                 sequence,
                 committed: true,
                 count: images.len() as u32,
                 checksum,
             })?;
+            drop(timer);
+            let timer = crate::profile::span(&self.profile, "commit/checkpoint_write");
             for (n, b) in images {
                 self.device().write_at(n * 4096, b)?;
             }
+            drop(timer);
+            let timer = crate::profile::span(&self.profile, "commit/checkpoint_flush");
             self.device().flush()?;
+            drop(timer);
+            let _timer = crate::profile::span(&self.profile, "commit/retire");
             self.controls(JournalControl {
                 sequence: clean_sequence,
                 committed: false,
@@ -320,6 +343,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         self.view.bitmap[n as usize / 8] & (1 << (n % 8)) != 0
     }
     fn allocate(&self, edit: &mut Edit) -> Result<u64> {
+        let _timer = crate::profile::span(&self.profile, "staging/allocate");
         let l = &self.view.superblock.layout;
         let start = edit.next;
         loop {
@@ -398,6 +422,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         Self::coalesce(node);
     }
     fn stage_node(&mut self, edit: &mut Edit, mut node: Node) -> Result<()> {
+        let _timer = crate::profile::span(&self.profile, "staging/metadata");
         if node.inode.kind == FileKind::Directory && node.inode.state == InodeState::Linked {
             while let Some(e) = node.extents.last_mut() {
                 let n = e.physical + e.length - 1;
@@ -582,6 +607,10 @@ impl<D: BlockDevice> ReadWriteFs<D> {
     /// Recovery exposes old or complete replacement blocks, not whole-request atomicity.
     /// An I/O error may occur after the affected transaction committed.
     pub fn write_file(&mut self, id: InodeId, offset: u64, bytes: &[u8]) -> Result<usize> {
+        let _timer = self
+            .profile
+            .as_ref()
+            .map(|p| p.span("request/write", bytes.len() as u64));
         self.healthy()?;
         if bytes.len() > MAX_READ {
             return Err(FsError::TooBig);
