@@ -48,7 +48,8 @@ target/debug/xffs-check disk.img
 # Remount with the same command to verify saved contents.
 ```
 
-Omit `--rw` for a read-only mount. Read-only images hold shared locks; writable
+Tune writable batches with `--write-batch-kib 4|16|64|256`; 4 KiB is the
+per-block baseline. Omit `--rw` for a read-only mount. Read-only images hold shared locks; writable
 images and all physical-device handles hold exclusive locks. Both modes retain `nosuid,nodev,default_permissions`; `--noexec`
 prevents execution. Writable ownership is the mounting user's; directories and
 executable files use 0755, ordinary files 0644. Chmod changes execute bits only.
@@ -57,14 +58,14 @@ Names preserve spelling and use Unicode 16.0 canonical-caseless matching.
 Successful mutating core operations are durable under the
 [storage contract](docs/storage-contract.md). Application buffering is outside
 that guarantee. File-data updates use fresh blocks and recover as old or complete
-replacement contents per 4-KiB transaction. Overwrites require spare space and
+replacement contents per durable batch (64 KiB by default). Overwrites require spare space and
 can return ENOSPC; multi-block requests can complete only a prefix. Fragmentation
 can also reach existing extent or metadata transaction limits. An I/O error may
 be reported after a transaction commits.
 
 Existing revision 2 images gain this behavior without migration; older writers
-remain compatible but do not provide the COW guarantee. Revision 1 remains
-read-only. This adds no snapshots, reflinks, metadata COW, batching, or
+remain readable-compatible but lack the newer COW and/or batch guarantees. Revision 1 remains
+read-only. This adds no snapshots, reflinks, metadata COW, or
 whole-request atomicity. See [writable behavior](docs/writable.md) for details.
 For atomic whole-file replacement, write and fsync a temporary file, rename it
 over the destination, and fsync its parent directory. Open handles retain the

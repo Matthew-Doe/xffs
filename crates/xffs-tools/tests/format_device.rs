@@ -115,6 +115,20 @@ fn serial_requires_exact_nonempty_match() {
 fn loop_format_check_and_writable_reopen() {
     use std::{fs, io::Write, process::Command};
     use xffs_core::{AccessMode, LinuxBlockDevice, ReadWriteFs, format::ROOT};
+    // Closing a loop descriptor can wake udev/desktop probes. Wait only for a
+    // transient exclusive-claim conflict; never mask identity or I/O failures.
+    fn open_loop(path: &str, access: AccessMode) -> LinuxBlockDevice {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match LinuxBlockDevice::open(path, access) {
+                Ok(device) => return device,
+                Err(DeviceError::LockContention) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => panic!("could not claim disposable loop {path}: {error:?}"),
+            }
+        }
+    }
     for sector in [512, 4096] {
         let image = std::env::temp_dir().join(format!(
             "xffs-format-loop-{}-{sector}.img",
@@ -175,7 +189,7 @@ fn loop_format_check_and_writable_reopen() {
                 .unwrap()
                 .success()
         );
-        let mut d = LinuxBlockDevice::open(&path, AccessMode::ReadWrite).unwrap();
+        let mut d = open_loop(&path, AccessMode::ReadWrite);
         let info = d.info().clone();
         let sysfs =
             std::path::PathBuf::from(format!("/sys/dev/block/{}:{}", info.major, info.minor));
@@ -194,13 +208,13 @@ fn loop_format_check_and_writable_reopen() {
         drop(d);
         xffs_tools::refresh_partition_view(std::path::Path::new(&path), &info).unwrap();
         assert_eq!(children(), 0, "stale kernel partition survived formatting");
-        let d = LinuxBlockDevice::open(&path, AccessMode::ReadWrite).unwrap();
+        let d = open_loop(&path, AccessMode::ReadWrite);
         let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
         let id = fs.create(ROOT, b"loop.txt", false).unwrap();
         fs.write_file(id, 0, b"loop persistence").unwrap();
         fs.sync().unwrap();
         drop(fs);
-        let d = LinuxBlockDevice::open(&path, AccessMode::ReadOnly).unwrap();
+        let d = open_loop(&path, AccessMode::ReadOnly);
         let mut fs = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
         let id = fs.lookup(ROOT, b"loop.txt").unwrap();
         assert_eq!(fs.read_file(id, 0, 16).unwrap(), b"loop persistence");

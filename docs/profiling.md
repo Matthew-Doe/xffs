@@ -55,7 +55,7 @@ Error counts apply to backend operations; phase counters do not classify errors.
 No per-I/O messages are logged during the workload. Counters are opt-in and have
 measurable overhead on fast images.
 
-## USB measurement — 2026-10-02
+## Historical per-block USB measurement — 2026-10-02
 
 The user's run is in `profile-usb-20261002`. The
 [tracked aggregate](hardware-results/2026-10-02-profile.json) retains exact counters.
@@ -92,20 +92,54 @@ overwrite. The same unprofiled image workload took 0.081 s and 0.096 s. These
 single-run results indicate around 15–20 ms instrumentation cost, orders of
 magnitude below the USB flush time; they are not USB throughput measurements.
 
-## Conclusion and next experiment
+## Bounded-batch experiment
 
-The measured bottleneck is synchronous durability in the Linux/device storage
-path, not allocator or checksum CPU time. These counters do not isolate USB
-firmware, NAND operations, or individual kernel block-layer requests.
+`profile-writes.py --write-batch-kib 4|16|64|256` passes the limit through image
+and device mounts and records it in `run.json`. Default: 64 KiB. The same binary
+in 4 KiB mode supplies the reproducible baseline. No format revision or barrier
+protocol changes are involved.
 
-The next optimization experiment should be bounded multi-block transactions,
-keeping COW, data-before-journal ordering, metadata capacity preflight, and
-durability guarantees. It needs an explicit transaction/short-write contract and
-crash tests before benchmarking. Simply removing flushes would invalidate the
-current storage protocol. No such optimization is included in this profiling
-change.
+`file_data/completed_batch.count` counts successfully retired file-data batches;
+its `attempted_bytes` field counts completed user bytes, excluding EOF-tail
+zeroing. `file_data/preflight_reduction.count` counts candidate halvings. These
+bounded, saturating counters use the existing metric schema with zero duration;
+they exclude namespace, cleanup and other metadata-only commits. A transaction
+that committed but subsequently reported an I/O error is not counted as completed.
+`commit/total` continues to include transaction preflight and execution.
 
-Validation: formatting, warnings-denied Clippy, workspace tests, 66 host harness
-tests and Python compilation passed. A focused instrumented/uninstrumented
-simulator comparison confirmed identical I/O order and error outcomes, including
-data-write, data-flush and later journal failures.
+After correctness validation, run all four settings three times in rotating
+order with unique evidence directories (8 MiB creation and overwrite each):
+
+```sh
+sudo python3 scripts/profile-batches.py --device \
+  --expect-serial 0085199340190280 \
+  --output "$PWD/profile-usb-batches-new"
+```
+
+Run from a terminal for sudo authentication. This runner never formats a physical
+device. Each run verifies contents, runs the filesystem checker after each phase,
+cleans up, and confirms restored free space. It stops on any failure. The output
+retains per-run binary hash, batch setting, transaction/flush counts, phase
+latencies, throughput and cleanup receipts. Configuration order rotates between
+repetitions; the optimized binary must remain unchanged throughout.
+
+`batch-summary.json` retains all timing samples and compares medians for creation
+and overwrite separately. The 64 KiB default must reduce total flush counts by at
+least 90% and improve median elapsed time in both workloads. Core tests separately
+require 16 data transactions / 112 flushes for aligned 1 MiB at 64 KiB versus
+256 / 1,792 at 4 KiB. The 16/256 KiB measurements are tuning evidence; they do not
+change the agreed default. On a failed performance criterion, investigate the
+retained phase timings before accepting the milestone.
+
+To regenerate the aggregate without touching the device:
+
+```sh
+python3 scripts/profile-batches.py --summarize-only --output profile-usb-batches-new
+```
+
+Omit `--device` and `--expect-serial` for a host-image harness check as an ordinary
+user. Host-image timings cannot satisfy USB acceptance. The completed
+[USB experiment](hardware-results/2026-10-02-batching.md) passed both criteria:
+64 KiB median creation 3.182 s versus 52.249 s, overwrite 2.376 s versus 52.293 s,
+and over 93% fewer total flushes. See the [validation record](verification-batching.md)
+for correctness and privileged-device checks.

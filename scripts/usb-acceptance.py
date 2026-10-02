@@ -755,7 +755,9 @@ class Harness:
             stop_worker(proc)
 
     @contextmanager
-    def mount(self, d, writable=False, abrupt=False, profile_json=None):
+    def mount(self, d, writable=False, abrupt=False, profile_json=None, write_batch_kib=None):
+        if write_batch_kib is not None and (not writable or write_batch_kib not in (4, 16, 64, 256)):
+            raise ValueError('write batch requires a writable mount and 4, 16, 64, or 256 KiB')
         tmp = Path(tempfile.mkdtemp(prefix='xffs-usb-mount-'))
         try:
             os.chown(tmp, self.uid, self.gid)
@@ -766,6 +768,8 @@ class Harness:
                     '--uid', str(self.uid), '--gid', str(self.gid)] + self.identity_args(d)
             if writable:
                 args.append('--rw')
+            if write_batch_kib is not None:
+                args.extend(['--write-batch-kib', str(write_batch_kib)])
             if profile_json is not None:
                 args.extend(['--profile-json', str(profile_json)])
             with (self.report / (str(time.time_ns()) + '-mount.log')).open('w') as log:

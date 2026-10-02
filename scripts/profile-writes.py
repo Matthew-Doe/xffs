@@ -57,10 +57,10 @@ def worker(mount, report, name, phase, mib):
 
 
 @contextmanager
-def image_mount(image, report, binary, phase, enabled=True):
+def image_mount(image, report, binary, phase, enabled=True, write_batch_kib=64):
     mount = report / 'mount'
     mount.mkdir(exist_ok=True)
-    args = [binary, image, mount, '--rw']
+    args = [binary, image, mount, '--rw', '--write-batch-kib', str(write_batch_kib)]
     if phase != 'cleanup' and enabled:
         args += ['--profile-json', report / (phase + '-profile.json')]
     with (report / (phase + '-mount.log')).open('w') as log:
@@ -105,6 +105,7 @@ def main():
     parser.add_argument('--device', action='store_true', help='use the serial-bound existing USB filesystem')
     parser.add_argument('--expect-serial', choices=[usb.SERIAL])
     parser.add_argument('--output', required=True, type=Path, help='new directory on host storage')
+    parser.add_argument('--write-batch-kib', type=int, choices=[4, 16, 64, 256], default=64)
     parser.add_argument('--size-mib', type=int, default=8)
     parser.add_argument('--bin-dir', type=Path, default=ROOT / 'target/release')
     args = parser.parse_args()
@@ -133,6 +134,7 @@ def main():
         'mount_binary': str(usb.BIN / 'mount-xffs'),
         'mount_binary_sha256': hashlib.sha256((usb.BIN / 'mount-xffs').read_bytes()).hexdigest(),
         'startup_excluded': True, 'nested_metrics_inclusive': True,
+        'write_batch_kib': args.write_batch_kib,
         'profiling_enabled': not args.no_profile,
     }
     usb.save(report / 'run.json', provenance)
@@ -143,9 +145,9 @@ def main():
             usb.run([usb.BIN / 'mkfs-xffs', image, '--size-mib', str(max(64, args.size_mib * 2)),
                      '--uuid', str(uuid.uuid4())])
         for phase in ('create', 'overwrite', 'cleanup'):
-            context = (harness.mount(device, writable=True,
+            context = (harness.mount(device, writable=True, write_batch_kib=args.write_batch_kib,
                        profile_json=report / (phase + '-profile.json') if phase != 'cleanup' and not args.no_profile else None)
-                       if harness else image_mount(image, report, usb.BIN / 'mount-xffs', phase, not args.no_profile))
+                       if harness else image_mount(image, report, usb.BIN / 'mount-xffs', phase, not args.no_profile, args.write_batch_kib))
             with context as mount:
                 print(f'{phase}: profiling {args.size_mib} MiB; keep the device connected', flush=True)
                 with (report / (phase + '-worker.log')).open('w') as log:

@@ -18,7 +18,7 @@ A backend error after mutation starts faults the writer. Subsequent operations
 return an I/O-class error until reopening. Successful mutating core calls are
 durable under the storage contract. Application buffering is outside that
 contract. Every file-data update uses copy-on-write (COW): recovery exposes
-either the previous block contents or the complete replacement under the
+a prefix of whole committed batches (each entirely old or entirely new) under the
 [storage contract](storage-contract.md). A backend failure can be reported after
 the transaction has committed, so an error does not promise rollback.
 
@@ -30,7 +30,11 @@ mappings, overflow metadata, and inode changes. Old storage remains unavailable
 until checkpointing and journal retirement complete successfully.
 New data blocks and exposed tails are initialized before metadata publication;
 sparse gaps remain unmapped and read as zeros. Each write request is at most 1 MiB
-and progresses in block-sized durable transactions. A short write reports only
+and progresses in bounded durable batches. The default is 64 KiB of user-data
+logical blocks; `ReadWriteFs::set_write_batch_kib` accepts 4, 16, 64, or 256.
+An unaligned batch is shortened to touch no more than its block limit. A separate
+EOF-tail replacement may add one block. Batches never span core write requests.
+A short write reports only
 completed transactions, including when a later backend failure faults the writer.
 
 Shrinking publishes the new size and old-size cleanup bound atomically. Cleanup
@@ -49,17 +53,26 @@ larger than 256 metadata images return `TooBig` (`E2BIG` at the adapter).
 Fresh data targets must be distinct, previously free, and allocated by the edit.
 Allocation, mapping, transaction-capacity, and memory checks precede data writes.
 Preflight failures leave the current transaction unchanged and the writer usable;
-earlier pieces of a multi-block request remain committed.
+earlier batches of a multi-block request remain committed. Preparation completes
+allocation, extent validation, bitmap images, journal descriptors/checksums,
+sequence and memory checks before the first write or flush. `NoSpace`, `TooBig`,
+and `ResourceLimit` halve the candidate block limit down to one; the reduced
+limit persists for the rest of that request. A rejected candidate changes neither
+allocation nor the next-fit cursor. Other failures are never retried, and no
+failure after execution begins is retried. If the smallest candidate fails,
+return its error if nothing completed, otherwise the completed byte count.
 
 Overwrites require spare space and may return `ENOSPC`; there is no in-place
 fallback. An EOF update may need two fresh data blocks, and extent fragmentation
 may require additional metadata blocks or reach existing extent/transaction limits.
-No snapshots, reflinks, metadata COW, transaction batching, whole-request
-atomicity, or performance improvement are provided.
+No snapshots, reflinks, metadata COW, cross-request buffering, or whole-request
+atomicity are provided. All seven durability barriers remain in every batch.
 
-Format revision 2, public APIs, CLI options, and request limits are unchanged.
+Format revision 2 and request limits are unchanged. Constructors and `OpenOptions`
+remain source-compatible.
 Existing revision 2 images gain COW behavior without migration when opened by
-this writer. Older writers can still open them but do not provide this guarantee.
+this writer. Older revision 2 writers remain readable-compatible but lack the
+newer COW and/or batch recovery guarantees.
 Revision 1 remains read-only.
 
 Namespace operations validate portable names and canonical-caseless uniqueness.
@@ -83,7 +96,11 @@ fsync the parent directory. Existing open handles retain the previous file.
 
 Build with `cargo build --workspace`, create a revision 2 image with
 `target/debug/mkfs-xffs disk.img --size-mib 64 --uuid <UUID>`, then run
-`target/debug/mount-xffs disk.img mountpoint --rw`. The process stays in the
+`target/debug/mount-xffs disk.img mountpoint --rw`. Add
+`--write-batch-kib 4|16|64|256` to tune batching (default 64). The option requires
+`--rw`; invalid values are rejected before the target is opened. 4 KiB mode is
+the per-block baseline using the same binary and transaction implementation.
+The process stays in the
 foreground. Unmount with `fusermount3 -u mountpoint`, and validate with
 `target/debug/xffs-check disk.img`. Omitting `--rw` preserves read-only behavior.
 Linux whole disks can be selected explicitly with `--device`; see
