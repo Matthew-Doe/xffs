@@ -53,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix='xffs-acceptance-image-') as tmp:
                         mode = 'verify-cold'
                 usb.run(['python3', ROOT / 'scripts/usb-acceptance.py', '_worker', mode, mount, report], timeout=180)
                 if writable:
-                    usb.trial_worker(mount, report, 'cow', iterations=2)
+                    usb.trial_worker(mount, report, 'cow', iterations=6)
                     usb.verify(mount, report, trial='cow')
                     usb.save(report / 'baseline.json', usb.snapshot(mount))
                 else:

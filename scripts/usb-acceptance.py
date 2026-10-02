@@ -305,7 +305,169 @@ def verify_cow(actual, n, phase, overwriting):
         assert actual is None or old.startswith(actual), f'invalid COW initialization: {n}'
 
 
+def cow_state(slot, generation):
+    base, _, offset, replacement = cow_versions(slot)
+    base = bytes(b & 127 for b in base)
+    if generation == 0:
+        return base
+    digest = hashlib.shake_256(f'XFFS cow {slot} generation {generation}'.encode()).digest(len(replacement))
+    # Adjacent generations differ in every updated byte; hashes distinguish
+    # generations beyond a simple old/new toggle and detect stale reused data.
+    data = bytes((b & 127) | ((generation % 2) << 7) for b in digest)
+    return base[:offset] + data + base[offset + len(data):]
+
+
+def cow_worker(mount, report, iterations=None):
+    # A unique folder allows evidence-preserving retries without changing the
+    # previous attempt's files, which are now part of the baseline manifest.
+    folder = mount / ('trial-cow-' + uuid.uuid4().hex)
+    log = report / 'trial-cow.jsonl'
+    with log.open('x'):
+        pass
+    record(log, {'event': 'cow-start', 'version': 2, 'folder': folder.name})
+    folder.mkdir()
+    sync_dir(mount)
+    for slot in range(2):
+        record(log, {'event': 'initialize', 'slot': slot})
+        write_sync(folder / f'{slot:06d}', cow_state(slot, 0))
+        sync_dir(folder)
+        record(log, {'event': 'initialized', 'slot': slot})
+    # No creation, truncation, or rename occurs after readiness.
+    with (folder / '000000').open('r+b', buffering=0) as full, (
+            folder / '000001').open('r+b', buffering=0) as partial:
+        for n in range(100000 if iterations is None else iterations):
+            slot, generation = n % 2, n // 2 + 1
+            _, _, offset, replacement = cow_versions(slot)
+            target = cow_state(slot, generation)
+            record(log, {'event': 'cow-intent', 'n': n, 'slot': slot,
+                         'generation': generation})
+            if n == 0:
+                save(report / 'ready-cow.json', {'ready': True, 'version': 2})
+            stage = 'write'
+            try:
+                f = (full, partial)[slot]
+                f.seek(offset)
+                remaining = memoryview(target[offset:offset + len(replacement)])
+                while remaining:
+                    written = f.write(remaining)
+                    if not written:
+                        raise OSError('overwrite made no progress')
+                    remaining = remaining[written:]
+                # Distinguish an interrupted data-write attempt from an error
+                # in fsync or a gap after the write returned.
+                record(log, {'event': 'cow-write-returned', 'n': n})
+                stage = 'fsync'
+                os.fsync(f.fileno())
+                record(log, {'event': 'cow-ack', 'n': n})
+            except OSError as error:
+                record(log, {'event': 'cow-interrupted', 'n': n,
+                             'stage': stage, 'error': str(error)})
+                return
+    if iterations is None:
+        raise RuntimeError('trial workload exhausted without unplugging')
+
+
+def verify_cow_repeated(mount, events):
+    start = events[0]
+    assert start['version'] == 2, 'unsupported COW evidence version'
+    name = start['folder']
+    assert name.startswith('trial-cow-') and Path(name).name == name, 'invalid COW folder'
+    folder = mount / name
+    assert folder.is_dir()
+    expected = {}
+    initialized = set()
+    initializing = set()
+    pending = None
+    returned = False
+    interrupted_write = False
+    count = 0
+    for event in events[1:]:
+        kind = event['event']
+        if kind == 'initialize':
+            slot = event['slot']
+            assert slot in (0, 1) and slot not in initializing
+            initializing.add(slot)
+        elif kind == 'initialized':
+            slot = event['slot']
+            assert slot in initializing and slot not in initialized
+            initialized.add(slot)
+            expected[slot] = 0
+        elif kind == 'cow-intent':
+            assert initialized == {0, 1} and pending is None
+            assert event['n'] == count and event['slot'] == count % 2
+            assert event['generation'] == expected[event['slot']] + 1
+            pending = event
+            returned = False
+            interrupted_write = False
+            count += 1
+        elif kind == 'cow-write-returned':
+            assert pending and event['n'] == pending['n'] and not returned
+            returned = True
+        elif kind == 'cow-ack':
+            assert pending and event['n'] == pending['n'] and returned
+            expected[pending['slot']] = pending['generation']
+            pending = None
+        elif kind == 'cow-interrupted':
+            assert pending and event['n'] == pending['n']
+            assert event['stage'] in ('write', 'fsync')
+            assert (event['stage'] == 'fsync') == returned
+            interrupted_write = event['stage'] == 'write'
+        else:
+            raise AssertionError('unknown COW evidence event')
+    allowed = {f'{slot:06d}' for slot in initializing}
+    assert {p.name for p in folder.iterdir()} <= allowed, 'unexpected COW namespace'
+    outcome = None
+    for slot in initializing:
+        path = folder / f'{slot:06d}'
+        actual = path.read_bytes() if path.exists() else None
+        if slot not in initialized:
+            old = cow_state(slot, 0)
+            assert actual is None or old.startswith(actual), 'invalid COW initialization'
+            continue
+        old = cow_state(slot, expected[slot])
+        if pending and slot == pending['slot']:
+            new = cow_state(slot, pending['generation'])
+            candidates = [new[:cut] + old[cut:] for cut in range(0, len(old) + 1, 4096)]
+            assert actual in candidates, 'torn or non-prefix COW overwrite'
+            outcome = ('old' if actual == old else 'new' if actual == new else 'prefix')
+        else:
+            assert actual == old, 'acknowledged COW data lost'
+    return {
+        'version': 2, 'data_valid': True,
+        'acknowledged_overwrites': count - int(pending is not None),
+        'unacknowledged_overwrite': pending is not None,
+        'write_error_observed': interrupted_write,
+        'recovered_outcome': outcome,
+        # A prefix is direct evidence of interrupted replacement publication.
+        # Otherwise require an error during data writing, not merely missing
+        # host acknowledgement or removal in the fsync/between-write gap.
+        'overwrite_interruption_observed': interrupted_write or outcome == 'prefix',
+    }
+
+
+def cow_coverage_passed(report):
+    path = report / 'cow-coverage.json'
+    return path.exists() and json.loads(path.read_text()).get('overwrite_interruption_observed') is True
+
+
+def archive_cow_attempt(report):
+    if not any((report / name).exists() for name in ('passed-cow.json', 'recovered-cow.json')):
+        raise RuntimeError('verify/recover the previous COW attempt before retrying')
+    archive = report / ('cow-history-' + uuid.uuid4().hex)
+    archive.mkdir()
+    for name in ('trial-cow.jsonl', 'ready-cow.json', 'passed-cow.json',
+                 'recovered-cow.json', 'cow-coverage.json', 'final.json'):
+        path = report / name
+        if path.exists():
+            path.rename(archive / name)
+    sync_dir(archive)
+    sync_dir(report)
+    record(report / 'events.jsonl', {'event': 'cow-retry', 'archive': archive.name})
+
+
 def trial_worker(mount, report, kind, iterations=None):
+    if kind == 'cow':
+        return cow_worker(mount, report, iterations)
     folder = mount / ('trial-' + kind)
     folder.mkdir()
     sync_dir(mount)
@@ -315,7 +477,7 @@ def trial_worker(mount, report, kind, iterations=None):
         pass
     for n in range(100000 if iterations is None else iterations):
         path = folder / f'{n:06d}'
-        content = cow_versions(n)[1] if kind == 'cow' else payload(kind, n)
+        content = payload(kind, n)
         record(log, {'event': 'intent', 'n': n, 'kind': kind,
                      'sha256': hashlib.sha256(content).hexdigest(), 'bytes': len(content)})
         if n == 0 and kind != 'cow':
@@ -330,25 +492,6 @@ def trial_worker(mount, report, kind, iterations=None):
                     f.flush()
                     os.fsync(f.fileno())
                 sync_dir(folder)
-                ack('done')
-            elif kind == 'cow':
-                old, _, offset, replacement = cow_versions(n)
-                write_sync(path, old)
-                sync_dir(folder)
-                ack('old')
-                # Persist intent before touching existing data. No truncate or rename.
-                record(log, {'event': 'overwrite', 'n': n})
-                if n == 0:
-                    save(report / 'ready-cow.json', {'ready': True})
-                with path.open('r+b', buffering=0) as f:
-                    f.seek(offset)
-                    remaining = memoryview(replacement)
-                    while remaining:
-                        written = f.write(remaining)
-                        if not written:
-                            raise OSError('overwrite made no progress')
-                        remaining = remaining[written:]
-                    os.fsync(f.fileno())
                 ack('done')
             elif kind == 'replace':
                 write_sync(path, payload(kind, n, 'old'))
@@ -380,6 +523,13 @@ def trial_worker(mount, report, kind, iterations=None):
 
 def verify_trial(mount, report, kind):
     events = [json.loads(line) for line in (report / ('trial-' + kind + '.jsonl')).read_text().splitlines()]
+    if kind == 'cow' and events and events[0]['event'] == 'cow-start':
+        save(report / 'cow-coverage.json', verify_cow_repeated(mount, events))
+        return
+    if kind == 'cow':
+        save(report / 'cow-coverage.json', {
+            'version': 1, 'overwrite_interruption_observed': False,
+            'reason': 'legacy trial: no direct overwrite-interruption evidence'})
     intentions = {e['n']: e for e in events if e['event'] == 'intent'}
     phases = {e['n']: e['phase'] for e in events if e['event'] == 'ack'}
     overwrites = {e['n'] for e in events if e['event'] == 'overwrite'}
@@ -440,6 +590,10 @@ def verify(mount, report, trial=None, cold=False):
     extras = set(actual) - set(expected)
     if trial:
         prefix = 'trial-' + trial
+        if trial == 'cow':
+            first = json.loads((report / 'trial-cow.jsonl').read_text().splitlines()[0])
+            if first['event'] == 'cow-start':
+                prefix = first['folder']
         assert all(name == prefix or name.startswith(prefix + '/') for name in extras)
         verify_trial(mount, report, trial)
     else:
@@ -640,6 +794,10 @@ def observed_removal(report, kind):
     if not (report / ('trial-' + kind + '.jsonl')).exists():
         raise RuntimeError('no trial intentions exist to resume')
     events = [json.loads(line) for line in (report / 'events.jsonl').read_text().splitlines()]
+    if kind == 'cow':
+        retries = [i for i, e in enumerate(events) if e.get('event') == 'cow-retry']
+        if retries:
+            events = events[retries[-1] + 1:]
     removals = [e for e in events if e.get('event') == 'removal-observed' and e.get('kind') == kind]
     if not removals or removals[-1]['device']['serial'] != SERIAL:
         raise RuntimeError('no recorded removal for this trial; use verify instead')
@@ -653,6 +811,11 @@ def complete_trial(h, d, kind):
         h.worker('verify-trial', mount, kind)
         h.worker('snapshot', mount)
     h.check(d)
+    if kind == 'cow' and not cow_coverage_passed(h.report):
+        save(h.report / 'recovered-cow.json', {'recovered': True, 'manual_trial_pass': False})
+        save(h.report / 'final.json', {'check_passed': True, 'cleanly_unmounted': True,
+             'acceptance_complete': False, 'pending': ['passed-cow.json']})
+        raise RuntimeError('COW data valid, but no overwrite interruption observed; use trial cow --retry')
     save(h.report / ('passed-' + kind + '.json'), {'passed': True, 'diskseq': d['diskseq']})
 
 
@@ -726,9 +889,12 @@ def main():
         sub.add_parser(action)
     trial = sub.add_parser('trial')
     trial.add_argument('kind', choices=TRIALS)
+    trial.add_argument('--retry', action='store_true', help='archive a recovered COW attempt and retry without formatting')
     resume = sub.add_parser('resume-trial')
     resume.add_argument('kind', choices=TRIALS)
     args = parser.parse_args()
+    if args.action == 'trial' and args.retry and args.kind != 'cow':
+        parser.error('--retry is only supported for trial cow')
     if args.action == 'accept':
         # Reusable acceptance never invokes formatting. Each child has its own
         # deadline and records evidence before the next phase starts.
@@ -788,11 +954,13 @@ def main():
         complete_trial(h, d, args.kind)
     elif args.action == 'trial':
         kind = args.kind
-        if (h.report / ('trial-' + kind + '.jsonl')).exists():
+        if (h.report / ('trial-' + kind + '.jsonl')).exists() and not args.retry:
             raise RuntimeError('trial evidence already exists; verify/recover it, never reformat')
         h.check(d)
         with h.mount(d, writable=True, abrupt=True) as mount:
             h.worker('verify', mount)
+            if args.retry:
+                archive_cow_attempt(h.report)
             worker = h.worker('trial', mount, kind, wait=False)
             try:
                 ready = h.report / ('ready-' + kind + '.json')
@@ -838,6 +1006,8 @@ def main():
         if args.action == 'finish':
             required = ['formatted.json', 'workload.json', 'passed-reconnect.json'] + ['passed-' + k + '.json' for k in TRIALS]
             missing = [p for p in required if not (h.report / p).exists()]
+            if not cow_coverage_passed(h.report) and 'passed-cow.json' not in missing:
+                missing.append('passed-cow.json')
             save(h.report / 'final.json', {'check_passed': True, 'cleanly_unmounted': True,
                  'acceptance_complete': not missing, 'pending': missing})
             if missing:

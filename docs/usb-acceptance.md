@@ -81,10 +81,12 @@ The same phases are individually reusable by replacing `accept` with:
 - `trial create`: create and append to new files; completed files become immutable.
 - `trial replace`: prepare old/new files and atomically replace each old name.
 - `trial cleanup`: truncate and delete newly created files.
-- `trial cow`: initialize and sync files, then overwrite existing blocks without
-  truncate or rename. Alternates three full blocks and unaligned partial updates
-  across three blocks. Checks unchanged bytes, old-or-new block contents,
-  committed prefixes, and survival of acknowledged overwrites.
+- `trial cow`: initialize and sync two files before prompting, then repeatedly
+  overwrite them without creation, truncate, or rename. Alternates three full
+  blocks and unaligned updates across three blocks. Checks generation-specific
+  data, untouched bytes, committed prefixes, and acknowledged durability.
+  Requires evidence of an interrupted data-write attempt or a recovered partial
+  block prefix; a between-write or fsync-only interruption is inconclusive.
 - `verify`: inspect read-only, validate the recovered view, mount writable to
   complete recovery, compare acknowledged content and validate interrupted
   outcomes. It never reformats or silently restarts a trial.
@@ -223,29 +225,52 @@ preserved. A failed verification or refresh leaves the missing receipt missing;
 do not manually invent a passing receipt or reformat to fix a reporting gap.
 
 
-## Adding COW verification to an existing acceptance run
+## Adding or retrying COW verification without formatting
 
 Keep the existing drive and evidence; do not format or repeat `accept`.
-For the completed September 30 run, use these fish-compatible commands:
+For the September 30 report whose first COW attempt interrupted initialization,
+run these commands. They use explicit paths and work in fish:
 
 ```fish
-set REPORT /home/matthewd/devel/xffs/usb-evidence-20260930-123545
 sudo python3 scripts/usb-acceptance.py \
-  --expect-serial 0085199340190280 --report-dir "$REPORT" trial cow
+  --expect-serial 0085199340190280 \
+  --report-dir /home/matthewd/devel/xffs/usb-evidence-20260930-123545 \
+  trial cow --retry
 and sudo python3 scripts/usb-acceptance.py \
-  --expect-serial 0085199340190280 --report-dir "$REPORT" finish
+  --expect-serial 0085199340190280 \
+  --report-dir /home/matthewd/devel/xffs/usb-evidence-20260930-123545 \
+  finish
 ```
 
-Follow the unplug/reconnect prompts. The COW trial publishes readiness only after
-the first old file is durable and its overwrite intent is recorded on the host.
-An unacknowledged overwrite may recover any complete block prefix; torn blocks,
-non-prefix replacements, missing initialized files, size changes, and lost
-acknowledged overwrites fail verification. Initialization interrupted on later
-files is checked separately. New and old bytes differ throughout every updated
-range. The existing filesystem checker validates recovered allocation ownership.
+For a report with no prior COW trial, omit `--retry`. Retry verifies the baseline,
+archives prior COW evidence and the final receipt in a unique `cow-history-*`
+directory, and preserves old test files as part of the baseline. New files get a
+unique directory. An unverified previous attempt must first use `verify` to
+recover and validate it; retry never discards corruption or reformats the drive.
+The old physical removal record cannot establish a pass for the new attempt.
 
-New full acceptance runs include COW and require `passed-cow.json`; earlier
-reports remain historical evidence for their original three trials. Interrupted
-COW trials use the existing `verify` / `resume-trial cow` workflow.
-A physical trial samples an uncontrolled failure point; it does not replace
-the simulator's exhaustive write/flush-boundary tests.
+Both files are initialized and synced before readiness. After the prompt, the
+worker only overwrites existing files, alternating full and unaligned updates.
+Successive generations have distinct patterns; every updated byte differs from
+the previous generation. The verifier rejects torn blocks, non-prefix recovery,
+size changes, changes outside partial updates, missing initialized files, and
+lost acknowledged generations.
+
+`cow-coverage.json` records acknowledged overwrites, an outstanding intent,
+whether a data-write error was observed, and whether recovery produced old,
+new, or a partial block prefix. A missing host acknowledgement alone does not
+prove an interrupted overwrite. Fsync-only failures and removal between writes
+leave the result inconclusive, with no new `passed-cow.json`; data is still
+verified and recovery completed. Use `trial cow --retry` for another attempt.
+If the writer was killed without recording an error, only a recovered partial
+prefix establishes interruption coverage.
+
+A write error establishes an interrupted write attempt, not the precise device
+persistence boundary: the call may fail before any bytes reach hardware. Physical
+trials sample uncontrolled failure points and complement the simulator's
+exhaustive write/flush-boundary tests.
+
+New acceptance completion requires a qualifying COW coverage report as well as
+`passed-cow.json`. Legacy trial receipts remain historical evidence and do not
+satisfy this stronger requirement. Interrupted trials retain the existing
+`verify` / `resume-trial cow` workflow.

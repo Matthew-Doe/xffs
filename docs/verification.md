@@ -140,3 +140,20 @@ All 59 host harness tests passed. Both normal and `--resume` runs of
 `scripts/acceptance-image-smoke.py` passed with COW verification before and after
 FUSE remount. These validate the new harness on images; the new physical COW
 unplug trial has not yet been run.
+
+### COW interruption coverage correction — 2026-10-01
+
+The first physical COW trial preserved five completed overwrites, but removal
+interrupted initialization of the sixth file. Its historical passing receipt
+establishes durability, not an interrupted-overwrite result.
+
+The revised worker initializes two files before readiness and repeatedly updates
+them with distinct generations. Coverage reports distinguish interrupted data
+writes, fsync-only failures, and gaps between writes; the latter two do not earn
+a COW interruption pass. A recovered partial block prefix independently provides
+interruption evidence. Retry archives prior evidence and retains prior files.
+
+All 64 host harness tests passed, including generation recovery, torn/non-prefix
+rejection, untouched-byte checks, coverage gating, and retry evidence preservation.
+Normal and resumed image-backed FUSE acceptance passed. No physical trial of
+this revised worker was run during implementation.

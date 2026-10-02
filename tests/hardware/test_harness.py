@@ -101,18 +101,126 @@ class CowTests(unittest.TestCase):
             mount, report = Path(tmp) / 'mount', Path(tmp) / 'report'
             mount.mkdir()
             report.mkdir()
-            usb.trial_worker(mount, report, 'cow', iterations=2)
+            usb.trial_worker(mount, report, 'cow', iterations=6)
             usb.verify_trial(mount, report, 'cow')
             self.assertTrue((report / 'ready-cow.json').exists())
             events = [json.loads(line) for line in (report / 'trial-cow.jsonl').read_text().splitlines()]
-            self.assertEqual([e['event'] for e in events],
-                             ['intent', 'ack', 'overwrite', 'ack'] * 2)
-            path = mount / 'trial-cow/000001'
+            self.assertEqual([e['event'] for e in events[:5]],
+                             ['cow-start', 'initialize', 'initialized', 'initialize', 'initialized'])
+            self.assertEqual([e['event'] for e in events[5:]],
+                             ['cow-intent', 'cow-write-returned', 'cow-ack'] * 6)
+            self.assertFalse(usb.cow_coverage_passed(report))
+            path = mount / events[0]['folder'] / '000001'
             data = bytearray(path.read_bytes())
             data[-1] ^= 1
             path.write_bytes(data)
             with self.assertRaises(AssertionError):
                 usb.verify_trial(mount, report, 'cow')
+
+    def repeated_case(self, iterations=4):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        mount, report = root / 'mount', root / 'report'
+        mount.mkdir()
+        report.mkdir()
+        usb.cow_worker(mount, report, iterations=iterations)
+        events = [json.loads(x) for x in (report / 'trial-cow.jsonl').read_text().splitlines()]
+        folder = mount / events[0]['folder']
+        return mount, report, folder, events
+
+    def test_pending_generation_and_interruption_coverage(self):
+        mount, report, folder, events = self.repeated_case()
+        # Two generations have completed on each file. Replace slot zero again.
+        intent = {'event': 'cow-intent', 'n': 4, 'slot': 0, 'generation': 3}
+        pending = events + [intent]
+        old, new = usb.cow_state(0, 2), usb.cow_state(0, 3)
+        path = folder / '000000'
+        for cut in range(0, len(old) + 1, 4096):
+            path.write_bytes(new[:cut] + old[cut:])
+            result = usb.verify_cow_repeated(mount, pending)
+            self.assertEqual(result['overwrite_interruption_observed'], cut in (4096, 8192))
+            result = usb.verify_cow_repeated(mount, pending + [
+                {'event': 'cow-interrupted', 'n': 4, 'stage': 'write'}])
+            self.assertTrue(result['overwrite_interruption_observed'])
+        path.write_bytes(new)
+        result = usb.verify_cow_repeated(mount, pending + [
+            {'event': 'cow-write-returned', 'n': 4},
+            {'event': 'cow-interrupted', 'n': 4, 'stage': 'fsync'}])
+        self.assertFalse(result['overwrite_interruption_observed'])
+        for bad in [new[:100] + old[100:], old[:4096] + new[4096:], new[:-1]]:
+            path.write_bytes(bad)
+            with self.assertRaises(AssertionError):
+                usb.verify_cow_repeated(mount, pending)
+        path.unlink()
+        with self.assertRaises(AssertionError):
+            usb.verify_cow_repeated(mount, pending)
+
+    def test_initialization_and_between_writes_cannot_pass_coverage(self):
+        mount, report, folder, events = self.repeated_case()
+        self.assertFalse(usb.verify_cow_repeated(mount, events)['overwrite_interruption_observed'])
+        # An acknowledged generation cannot roll back.
+        (folder / '000000').write_bytes(usb.cow_state(0, 1))
+        with self.assertRaises(AssertionError):
+            usb.verify_cow_repeated(mount, events)
+        (folder / '000001').unlink()
+        (folder / '000000').write_bytes(usb.cow_state(0, 0)[:100])
+        result = usb.verify_cow_repeated(mount, events[:2])
+        self.assertFalse(result['overwrite_interruption_observed'])
+
+    def test_unaligned_pending_generation_preserves_untouched_bytes(self):
+        mount, report, folder, events = self.repeated_case(iterations=5)
+        events.append({'event': 'cow-intent', 'n': 5, 'slot': 1, 'generation': 3})
+        old, new = usb.cow_state(1, 2), usb.cow_state(1, 3)
+        path = folder / '000001'
+        for cut in range(0, len(old) + 1, 4096):
+            path.write_bytes(new[:cut] + old[cut:])
+            usb.verify_cow_repeated(mount, events)
+        damaged = bytearray(new)
+        damaged[0] ^= 1
+        path.write_bytes(damaged)
+        with self.assertRaises(AssertionError):
+            usb.verify_cow_repeated(mount, events)
+        path.write_bytes(usb.cow_state(1, 1))
+        with self.assertRaises(AssertionError):
+            usb.verify_cow_repeated(mount, events)
+
+    def test_completion_requires_coverage_after_recovery(self):
+        for covered in [False, True]:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = Path(tmp)
+                usb.save(report / 'cow-coverage.json',
+                         {'overwrite_interruption_observed': covered})
+                h = mock.Mock(report=report)
+                h.mount.return_value = contextlib.nullcontext(Path('/unused'))
+                if covered:
+                    usb.complete_trial(h, {'diskseq': 8}, 'cow')
+                    self.assertTrue((report / 'passed-cow.json').exists())
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'no overwrite interruption'):
+                        usb.complete_trial(h, {'diskseq': 8}, 'cow')
+                    self.assertFalse((report / 'passed-cow.json').exists())
+                    self.assertTrue((report / 'recovered-cow.json').exists())
+                    self.assertFalse(json.loads((report / 'final.json').read_text())['acceptance_complete'])
+
+    def test_retry_preserves_evidence_and_excludes_old_removal(self):
+        mount, report, folder, events = self.repeated_case()
+        with self.assertRaisesRegex(RuntimeError, 'verify/recover'):
+            usb.archive_cow_attempt(report)
+        usb.save(report / 'recovered-cow.json', {'recovered': True})
+        usb.record(report / 'events.jsonl', {'event': 'removal-observed', 'kind': 'cow',
+                                          'device': {'serial': usb.SERIAL}})
+        original = (report / 'trial-cow.jsonl').read_bytes()
+        usb.archive_cow_attempt(report)
+        archive = next(report.glob('cow-history-*'))
+        self.assertEqual((archive / 'trial-cow.jsonl').read_bytes(), original)
+        self.assertFalse((report / 'ready-cow.json').exists())
+        self.assertTrue(folder.exists())
+        usb.cow_worker(mount, report, iterations=1)
+        self.assertEqual(len(list(mount.iterdir())), 2)
+        with self.assertRaisesRegex(RuntimeError, 'no recorded removal'):
+            usb.observed_removal(report, 'cow')
+
 
 
 class ProcessTests(unittest.TestCase):
