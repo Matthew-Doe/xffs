@@ -1,7 +1,7 @@
 # XFFS 0.0.2 COW source-release candidate
 
-This candidate adds file-data copy-on-write while retaining the metadata redo
-journal. It is prepared for a separate tagging/publishing decision; this document
+This verified candidate completes the file-data copy-on-write milestone while
+retaining the metadata redo journal. It is prepared for a separate tagging/publishing decision; this document
 does not claim that a 0.0.2 tag or public release exists.
 
 Every file-data update uses fresh storage, including partial overwrites and

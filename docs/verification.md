@@ -1,5 +1,8 @@
 # Writable POC verification
 
+The completed [0.0.2 COW milestone](release-verification-0.0.2.md) records
+current release-candidate checks and the October 1 hardware evidence.
+
 For the completed 0.0.1 source-release checks, see the
 [release verification record](release-verification.md). The historical image
 acceptance record below is retained. The [COW update](#file-data-cow-verification--2026-09-30)
