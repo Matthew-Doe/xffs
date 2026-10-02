@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, path::Path};
 pub struct ReadWriteFs<D: BlockDevice = ImageDevice> {
     pub(crate) view: ReadOnlyFs<D>,
     sequence: u64,
+    write_batch_blocks: usize,
     faulted: bool,
     memory_limit: usize,
     next_block: u64,
@@ -16,6 +17,7 @@ pub struct ReadWriteFs<D: BlockDevice = ImageDevice> {
     profile: Option<crate::profile::Profiler>,
 }
 struct PreparedTransaction {
+    _total: Option<crate::profile::Span>,
     payload: Vec<Block>,
     committed: [Block; 2],
     clean: [Block; 2],
@@ -79,6 +81,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             view,
             sequence: control.sequence,
             faulted: false,
+            write_batch_blocks: 16,
             memory_limit: options.memory_limit,
         };
         // Repair both controls to the selected state before any home writes or reuse.
@@ -99,6 +102,15 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         }
         fs.resume_cleanup()?;
         Ok(fs)
+    }
+    /// Bound each durable file-data transaction to 4, 16, 64 (default), or 256 KiB.
+    /// A separate EOF-tail replacement may use one additional fresh block.
+    pub fn set_write_batch_kib(&mut self, kib: usize) -> Result<()> {
+        if !matches!(kib, 4 | 16 | 64 | 256) {
+            return Err(FsError::InvalidInput);
+        }
+        self.write_batch_blocks = kib / 4;
+        Ok(())
     }
     pub fn set_profiler(&mut self, profile: crate::profile::Profiler) {
         self.profile = Some(profile);
@@ -135,6 +147,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         images: &BTreeMap<u64, Block>,
         data: &[(u64, Block)],
     ) -> Result<PreparedTransaction> {
+        let total = crate::profile::span(&self.profile, "commit/total");
         let _preflight = crate::profile::span(&self.profile, "commit/preflight");
         self.healthy()?;
         if images.is_empty() || images.len() > 256 {
@@ -194,6 +207,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             ])
         };
         Ok(PreparedTransaction {
+            _total: total,
             payload,
             committed: encode_controls(JournalControl {
                 sequence,
@@ -216,8 +230,8 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         data: &[(u64, Block)],
         prepared: PreparedTransaction,
     ) -> Result<()> {
-        let _commit = crate::profile::span(&self.profile, "commit/total");
         let PreparedTransaction {
+            _total,
             payload,
             committed,
             clean,
@@ -670,7 +684,7 @@ impl<D: BlockDevice> ReadWriteFs<D> {
     }
     /// At most 1 MiB per request. A short result counts only retired transactions.
     /// Each block uses fresh storage (including overwrites, which may return NoSpace).
-    /// Recovery exposes old or complete replacement blocks, not whole-request atomicity.
+    /// Recovery exposes a prefix of whole committed batches, not whole-request atomicity.
     /// An I/O error may occur after the affected transaction committed.
     pub fn write_file(&mut self, id: InodeId, offset: u64, bytes: &[u8]) -> Result<usize> {
         let _timer = self
@@ -688,10 +702,22 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             return Err(FsError::IsDirectory);
         }
         let mut completed = 0;
+        let mut limit = self.write_batch_blocks;
         while completed < bytes.len() {
             let pos = offset + completed as u64;
-            let count = (bytes.len() - completed).min(BLOCK - (pos % 4096) as usize);
-            let result = self.write_piece(id, pos, &bytes[completed..completed + count]);
+            let count = (bytes.len() - completed).min(limit * BLOCK - (pos % 4096) as usize);
+            let prepared = self.prepare_write(id, pos, &bytes[completed..completed + count]);
+            let result = match prepared {
+                Err(FsError::NoSpace | FsError::TooBig | FsError::ResourceLimit) if limit > 1 => {
+                    limit /= 2;
+                    if let Some(p) = &self.profile {
+                        p.event("file_data/preflight_reduction", 0);
+                    }
+                    continue;
+                }
+                Err(e) => Err(e),
+                Ok(edit) => self.execute_edit(edit),
+            };
             if let Err(e) = result {
                 return if completed == 0 {
                     Err(e)
@@ -699,25 +725,33 @@ impl<D: BlockDevice> ReadWriteFs<D> {
                     Ok(completed)
                 };
             }
+            if let Some(p) = &self.profile {
+                p.event("file_data/completed_batch", count as u64);
+            }
             completed += count;
         }
         Ok(completed)
     }
-    fn write_piece(&mut self, id: InodeId, offset: u64, bytes: &[u8]) -> Result<()> {
+    fn prepare_write(&mut self, id: InodeId, offset: u64, bytes: &[u8]) -> Result<PreparedEdit> {
         let mut edit = self.edit(&[id])?;
         let mut node = self.view.node(id)?.clone();
         if offset + bytes.len() as u64 > node.inode.size {
             self.zero_tail(&mut edit, &mut node)?;
         }
-        let logical = offset / 4096;
-        let b = self.stage_data(&mut edit, &mut node, logical)?;
-        let start = (offset % 4096) as usize;
-        b[start..start + bytes.len()].copy_from_slice(bytes);
+        let mut copied = 0;
+        while copied < bytes.len() {
+            let pos = offset + copied as u64;
+            let start = (pos % 4096) as usize;
+            let count = (bytes.len() - copied).min(BLOCK - start);
+            let b = self.stage_data(&mut edit, &mut node, pos / 4096)?;
+            b[start..start + count].copy_from_slice(&bytes[copied..copied + count]);
+            copied += count;
+        }
         node.inode.size = node.inode.size.max(offset + bytes.len() as u64);
         node.inode.times[1] = now();
         node.inode.times[2] = now();
         self.stage_node(&mut edit, node)?;
-        self.finish(edit)
+        self.prepare_edit(edit)
     }
     pub fn append(&mut self, id: InodeId, bytes: &[u8]) -> Result<usize> {
         let offset = self.getattr(id)?.size;

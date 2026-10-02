@@ -10,6 +10,9 @@ struct Args {
     #[arg(long)]
     profile_json: Option<PathBuf>,
     mountpoint: PathBuf,
+    /// Maximum user-data KiB per durable transaction (default: 64).
+    #[arg(long, requires = "rw", value_parser = parse_write_batch)]
+    write_batch_kib: Option<usize>,
     #[arg(long)]
     noexec: bool,
     #[arg(long)]
@@ -46,6 +49,12 @@ fn owner(
         return Err("only root can select a different mounting uid/gid".into());
     }
     Ok(selected)
+}
+fn parse_write_batch(value: &str) -> std::result::Result<usize, String> {
+    match value.parse() {
+        Ok(n @ (4 | 16 | 64 | 256)) => Ok(n),
+        _ => Err("write batch must be 4, 16, 64, or 256 KiB".into()),
+    }
 }
 fn main() -> Result<()> {
     let a = Args::parse();
@@ -112,6 +121,7 @@ fn main() -> Result<()> {
     };
     let adapter = if a.rw {
         let mut fs = xffs_core::ReadWriteFs::from_device(device, options)?;
+        fs.set_write_batch_kib(a.write_batch_kib.unwrap_or(64))?;
         if let Some(p) = &profile {
             fs.set_profiler(p.clone());
         }
@@ -140,6 +150,45 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_option_is_validated_before_opening() {
+        for value in ["4", "16", "64", "256"] {
+            assert!(
+                Args::try_parse_from([
+                    "mount-xffs",
+                    "missing",
+                    "mount",
+                    "--rw",
+                    "--write-batch-kib",
+                    value
+                ])
+                .is_ok()
+            );
+            assert!(
+                Args::try_parse_from([
+                    "mount-xffs",
+                    "missing",
+                    "mount",
+                    "--write-batch-kib",
+                    value
+                ])
+                .is_err()
+            );
+        }
+        for value in ["0", "8", "128", "-4", "text"] {
+            assert!(
+                Args::try_parse_from([
+                    "mount-xffs",
+                    "missing",
+                    "mount",
+                    "--rw",
+                    "--write-batch-kib",
+                    value
+                ])
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn device_root_requires_non_root_identity() {
         assert!(owner((0, 0), true, None, None).is_err());

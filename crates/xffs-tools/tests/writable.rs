@@ -33,6 +33,7 @@ struct Backend {
     mutations: usize,
     tear: bool,
     tear_at: usize,
+    selective: Option<usize>,
 }
 #[derive(Clone)]
 struct Shared(Rc<RefCell<Backend>>);
@@ -50,6 +51,7 @@ impl Shared {
             mutations: 0,
             tear: false,
             tear_at: BLOCK / 2,
+            selective: None,
         })))
     }
     fn arm(&self, n: usize, tear: bool) {
@@ -65,7 +67,9 @@ impl Shared {
             b.sim
                 .pending_writes()
                 .iter()
-                .map(|w| Fragment {
+                .enumerate()
+                .filter(|(i, _)| b.selective.is_none_or(|parity| i % 2 == parity))
+                .map(|(_, w)| Fragment {
                     write_id: w.id,
                     range: 0..w.payload.len().min(b.tear_at),
                 })
@@ -103,7 +107,9 @@ impl BlockDevice for Shared {
                 s.sim
                     .pending_writes()
                     .iter()
-                    .map(|w| Fragment {
+                    .enumerate()
+                    .filter(|(i, _)| s.selective.is_none_or(|parity| i % 2 == parity))
+                    .map(|(_, w)| Fragment {
                         write_id: w.id,
                         range: 0..w.payload.len().min(s.tear_at),
                     })
@@ -292,6 +298,7 @@ fn partial_write_and_memory_preflight() {
     let d = Shared::new(&bytes);
     let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
     let id = fs.lookup(ROOT, b"empty.txt").unwrap();
+    fs.set_write_batch_kib(4).unwrap();
     // First block transaction uses 21 mutations; failure is in the next one.
     d.arm(25, false);
     assert_eq!(fs.write_file(id, 0, &vec![3; 8192]).unwrap(), 4096);
@@ -885,6 +892,8 @@ fn mapping_limit_preflight(count: usize) {
         writes: 0,
     })));
     let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let profile = xffs_core::profile::Profiler::default();
+    fs.set_profiler(profile.clone());
     let before = fs.statfs().unwrap();
     d.0.borrow_mut().writes = 0;
     assert!(matches!(
@@ -894,6 +903,11 @@ fn mapping_limit_preflight(count: usize) {
     assert_eq!(d.0.borrow().writes, 0);
     assert_eq!(fs.statfs().unwrap(), before);
     assert_eq!(fs.getattr(file.id).unwrap(), file);
+    assert!(
+        profile
+            .json()
+            .contains("\"file_data/preflight_reduction\":{\"count\":4,")
+    );
     if count == MAX_EXTENTS {
         assert!(matches!(fs.append(file.id, b"x"), Err(FsError::TooBig)));
         assert_eq!(d.0.borrow().writes, 0);
@@ -920,12 +934,19 @@ fn mapping_limit_preflight(count: usize) {
         },
     )
     .unwrap();
+    profile.clear();
+    limited.set_profiler(profile.clone());
     d.0.borrow_mut().writes = 0;
     assert!(matches!(
         limited.write_file(file.id, 0, b"x"),
         Err(FsError::ResourceLimit)
     ));
     assert_eq!(d.0.borrow().writes, 0);
+    assert!(
+        profile
+            .json()
+            .contains("\"file_data/preflight_reduction\":{\"count\":4,")
+    );
     drop(limited);
     let mut ro = ReadOnlyFs::from_device(d, OpenOptions::default()).unwrap();
     assert_eq!(ro.read_file(file.id, file.size, 1).unwrap(), b"x");
@@ -996,89 +1017,99 @@ fn mutation_count(d: &Shared) -> usize {
 #[test]
 fn cow_trace_boundaries_prefixes_and_reclamation() {
     let blank = fixture(FormatRevision::Two, None);
-    for scenario in 0..6 {
-        let setup = Shared::new(&blank);
-        let mut fs = ReadWriteFs::from_device(setup.clone(), OpenOptions::default()).unwrap();
-        let empty_stats = fs.statfs().unwrap();
-        let id = fs.create(ROOT, b"cow", false).unwrap();
-        fs.write_file(id, 0, &vec![1; 3 * BLOCK]).unwrap();
-        if scenario >= 3 {
-            fs.truncate(id, 17).unwrap();
-        }
-        let old = fs.read_file(id, 0, 4 * BLOCK).unwrap();
-        let baseline = setup.0.borrow().sim.durable_bytes().to_vec();
-        let (offset, data) = match scenario {
-            0 => (0, vec![2; BLOCK]),
-            1 => (100, vec![2; 200]),
-            2 => (3000, vec![2; 6000]),
-            3 => (30, vec![2; 40]),
-            4 => (2 * BLOCK as u64 + 10, vec![2; 40]),
-            _ => (0, vec![]),
-        };
-        let mut states = vec![(0, old.clone())];
-        let mut expected = old;
-        let mut completed = 0;
-        if scenario == 5 {
-            expected.resize(3 * BLOCK, 0);
-            states.push((0, expected));
-        } else {
-            while completed < data.len() {
-                let pos = offset as usize + completed;
-                let count = (data.len() - completed).min(BLOCK - pos % BLOCK);
-                expected.resize(expected.len().max(pos + count), 0);
-                expected[pos..pos + count].copy_from_slice(&data[completed..completed + count]);
-                completed += count;
-                states.push((completed, expected.clone()));
+    for kib in [4, 16, 64, 256] {
+        let batch = kib * 1024;
+        for scenario in 0..7 {
+            let setup = Shared::new(&blank);
+            let mut fs = ReadWriteFs::from_device(setup.clone(), OpenOptions::default()).unwrap();
+            fs.set_write_batch_kib(kib).unwrap();
+            let empty_stats = fs.statfs().unwrap();
+            let id = fs.create(ROOT, b"cow", false).unwrap();
+            fs.write_file(id, 0, &vec![1; 3 * BLOCK]).unwrap();
+            if (3..=5).contains(&scenario) {
+                fs.truncate(id, 17).unwrap();
             }
-        }
-        setup.0.borrow_mut().sim.clear_trace();
-        if scenario == 5 {
-            fs.truncate(id, 3 * BLOCK as u64).unwrap();
-        } else {
-            assert_eq!(fs.write_file(id, offset, &data).unwrap(), data.len());
-        }
-        let boundaries = mutation_count(&setup);
-        assert!(boundaries > 0);
-        drop(fs);
-        for prefix in [0, 1, 80, BLOCK / 2, BLOCK - 1, BLOCK] {
-            // Include a no-failure run to require successful writes to survive.
-            for failure in 1..=boundaries + 1 {
-                let d = Shared::new(&baseline);
-                let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
-                d.arm(failure, prefix != 0);
-                d.0.borrow_mut().tear_at = prefix;
-                let result = if scenario == 5 {
-                    fs.truncate(id, 3 * BLOCK as u64).map(|()| 0)
-                } else {
-                    fs.write_file(id, offset, &data)
-                };
-                drop(fs);
-                d.crash();
-                let mut recovered =
-                    ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
-                let got = recovered.read_file(id, 0, 4 * BLOCK).unwrap();
-                let state = states
-                    .iter()
-                    .position(|(_, bytes)| *bytes == got)
-                    .unwrap_or_else(|| {
-                        panic!("torn data: scenario {scenario}, failure {failure}, prefix {prefix}")
-                    });
-                if let Ok(n) = result {
-                    assert!(states[state].0 >= n);
-                    if scenario == 5 {
-                        assert_eq!(state, 1);
-                    }
+            let old = fs.read_file(id, 0, batch + 4 * BLOCK).unwrap();
+            let baseline = setup.0.borrow().sim.durable_bytes().to_vec();
+            let (offset, data) = match scenario {
+                0 => (0, vec![2; BLOCK]),
+                1 => (100, vec![2; 200]),
+                2 => (3000, vec![2; 6000]),
+                3 => (30, vec![2; 40]),
+                4 => (2 * BLOCK as u64 + 10, vec![2; 40]),
+                5 => (0, vec![]),
+                _ => (3000, vec![2; batch + BLOCK]),
+            };
+            let mut states = vec![(0, old.clone())];
+            let mut expected = old;
+            let mut completed = 0;
+            if scenario == 5 {
+                expected.resize(3 * BLOCK, 0);
+                states.push((0, expected));
+            } else {
+                while completed < data.len() {
+                    let pos = offset as usize + completed;
+                    let count = (data.len() - completed).min(batch - pos % BLOCK);
+                    expected.resize(expected.len().max(pos + count), 0);
+                    expected[pos..pos + count].copy_from_slice(&data[completed..completed + count]);
+                    completed += count;
+                    states.push((completed, expected.clone()));
                 }
-                let stats = recovered.statfs().unwrap();
-                drop(recovered);
-                d.crash();
-                let mut recovered =
-                    ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
-                assert_eq!(recovered.read_file(id, 0, 4 * BLOCK).unwrap(), got);
-                assert_eq!(recovered.statfs().unwrap(), stats);
-                recovered.write_file(id, 0, b"reused").unwrap();
-                recovered.unlink(ROOT, b"cow").unwrap();
-                assert_eq!(recovered.statfs().unwrap(), empty_stats);
+            }
+            setup.0.borrow_mut().sim.clear_trace();
+            if scenario == 5 {
+                fs.truncate(id, 3 * BLOCK as u64).unwrap();
+            } else {
+                assert_eq!(fs.write_file(id, offset, &data).unwrap(), data.len());
+            }
+            let boundaries = mutation_count(&setup);
+            assert!(boundaries > 0);
+            drop(fs);
+            for prefix in [0, 1, 80, BLOCK / 2, BLOCK - 1, BLOCK, BLOCK + 1, BLOCK + 2] {
+                // Include a no-failure run to require successful writes to survive.
+                for failure in 1..=boundaries + 1 {
+                    let d = Shared::new(&baseline);
+                    let mut fs =
+                        ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                    fs.set_write_batch_kib(kib).unwrap();
+                    d.arm(failure, prefix != 0);
+                    d.0.borrow_mut().tear_at = prefix.min(BLOCK);
+                    d.0.borrow_mut().selective = (prefix > BLOCK).then_some(prefix % 2);
+                    let result = if scenario == 5 {
+                        fs.truncate(id, 3 * BLOCK as u64).map(|()| 0)
+                    } else {
+                        fs.write_file(id, offset, &data)
+                    };
+                    drop(fs);
+                    d.crash();
+                    let mut recovered =
+                        ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                    let got = recovered.read_file(id, 0, batch + 4 * BLOCK).unwrap();
+                    let state = states
+                        .iter()
+                        .position(|(_, bytes)| *bytes == got)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "torn data: scenario {scenario}, failure {failure}, prefix {prefix}"
+                            )
+                        });
+                    if let Ok(n) = result {
+                        assert!(states[state].0 >= n);
+                        if scenario == 5 {
+                            assert_eq!(state, 1);
+                        }
+                    }
+                    let stats = recovered.statfs().unwrap();
+                    drop(recovered);
+                    d.crash();
+                    let mut recovered =
+                        ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+                    assert_eq!(recovered.read_file(id, 0, batch + 4 * BLOCK).unwrap(), got);
+                    assert_eq!(recovered.statfs().unwrap(), stats);
+                    recovered.write_file(id, 0, b"reused").unwrap();
+                    recovered.unlink(ROOT, b"cow").unwrap();
+                    assert_eq!(recovered.statfs().unwrap(), empty_stats);
+                }
             }
         }
     }
@@ -1089,10 +1120,10 @@ fn cow_recovery_can_itself_be_interrupted() {
     let d = Shared::new(&fixture(FormatRevision::Two, None));
     let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
     let id = fs.create(ROOT, b"cow", false).unwrap();
-    fs.write_file(id, 0, &[1; BLOCK]).unwrap();
+    fs.write_file(id, 0, &[1; 16 * BLOCK]).unwrap();
     let baseline = d.0.borrow().sim.durable_bytes().to_vec();
     d.0.borrow_mut().sim.clear_trace();
-    fs.write_file(id, 0, &[2; BLOCK]).unwrap();
+    fs.write_file(id, 0, &[2; 16 * BLOCK]).unwrap();
     let boundaries = mutation_count(&d);
     drop(fs);
     // Select a crash image with a committed journal awaiting checkpoint/retirement.
@@ -1101,7 +1132,7 @@ fn cow_recovery_can_itself_be_interrupted() {
         let d = Shared::new(&baseline);
         let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
         d.arm(failure, false);
-        let _ = fs.write_file(id, 0, &[2; BLOCK]);
+        let _ = fs.write_file(id, 0, &[2; 16 * BLOCK]);
         drop(fs);
         d.crash();
         let bytes = d.0.borrow().sim.durable_bytes().to_vec();
@@ -1128,7 +1159,7 @@ fn cow_recovery_can_itself_be_interrupted() {
             let _ = ReadWriteFs::from_device(d.clone(), OpenOptions::default());
             d.crash();
             let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
-            assert_eq!(fs.read_file(id, 0, BLOCK).unwrap(), [2; BLOCK]);
+            assert_eq!(fs.read_file(id, 0, 16 * BLOCK).unwrap(), [2; 16 * BLOCK]);
             fs.write_file(id, 0, &[3; BLOCK]).unwrap();
         }
     }
@@ -1182,4 +1213,175 @@ fn profiling_preserves_io_order_and_errors() {
         assert_eq!(outcomes[0], outcomes[1]);
         assert_eq!(traces[0], traces[1]);
     }
+}
+
+#[test]
+fn batch_limits_counts_and_request_boundaries() {
+    fn metric(json: &str, name: &str, field: &str) -> usize {
+        json.split(&format!("\"{name}\":{{"))
+            .nth(1)
+            .unwrap()
+            .split(&format!("\"{field}\":"))
+            .nth(1)
+            .unwrap()
+            .split([',', '}'])
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    use xffs_core::profile::{ProfiledDevice, Profiler};
+    let blank = fixture(FormatRevision::Two, None);
+    for kib in [4, 16, 64, 256] {
+        let d = Shared::new(&blank);
+        let profile = Profiler::default();
+        let mut fs = ReadWriteFs::from_device(
+            ProfiledDevice::new(d.clone(), profile.clone()),
+            OpenOptions::default(),
+        )
+        .unwrap();
+        fs.set_profiler(profile.clone());
+        fs.set_write_batch_kib(kib).unwrap();
+        for invalid in [0, 1, 8, 32, 128, 512, usize::MAX] {
+            assert!(matches!(
+                fs.set_write_batch_kib(invalid),
+                Err(FsError::InvalidInput)
+            ));
+        }
+        let empty = fs.statfs().unwrap();
+        let id = fs.create(ROOT, b"batch", false).unwrap();
+        for byte in [1, 2] {
+            profile.clear();
+            assert_eq!(
+                fs.write_file(id, 0, &vec![byte; 1024 * 1024]).unwrap(),
+                1024 * 1024
+            );
+            let metrics = profile.json();
+            let batches = 1024 / kib;
+            assert_eq!(
+                metric(&metrics, "file_data/completed_batch", "count"),
+                batches
+            );
+            assert_eq!(
+                metric(&metrics, "file_data/completed_batch", "attempted_bytes"),
+                1024 * 1024
+            );
+            assert_eq!(metric(&metrics, "backend/flush", "count"), batches * 7);
+            d.crash();
+            assert_eq!(
+                fs.read_file(id, 0, 1024 * 1024).unwrap(),
+                vec![byte; 1024 * 1024]
+            );
+        }
+        profile.clear();
+        fs.append(id, b"a").unwrap();
+        fs.append(id, b"b").unwrap();
+        let metrics = profile.json();
+        assert_eq!(metric(&metrics, "file_data/completed_batch", "count"), 2);
+        assert!(matches!(
+            fs.write_file(id, 0, &vec![0; 1024 * 1024 + 1]),
+            Err(FsError::TooBig)
+        ));
+        fs.unlink(ROOT, b"batch").unwrap();
+        assert_eq!(fs.statfs().unwrap(), empty);
+    }
+}
+
+#[test]
+fn default_batch_is_64_kib() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"default", false).unwrap();
+    d.0.borrow_mut().sim.clear_trace();
+    fs.write_file(id, 0, &vec![1; 1024 * 1024]).unwrap();
+    assert_eq!(
+        d.0.borrow()
+            .sim
+            .trace()
+            .iter()
+            .filter(|e| matches!(e.kind, xffs_sim::EventKind::Flush { .. }))
+            .count(),
+        112
+    );
+}
+
+#[test]
+fn one_spare_block_reduces_once_per_request() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let id = fs.create(ROOT, b"full", false).unwrap();
+    let bytes = (fs.statfs().unwrap().free_blocks as usize - 1) * BLOCK;
+    let mut offset = 0;
+    while offset < bytes {
+        let count = (bytes - offset).min(1024 * 1024);
+        assert_eq!(
+            fs.write_file(id, offset as u64, &vec![1; count]).unwrap(),
+            count
+        );
+        offset += count;
+        d.0.borrow_mut().sim.clear_trace();
+    }
+    assert_eq!(fs.statfs().unwrap().free_blocks, 1);
+    let p = xffs_core::profile::Profiler::default();
+    fs.set_profiler(p.clone());
+    assert_eq!(
+        fs.write_file(id, 0, &vec![8; 3 * BLOCK]).unwrap(),
+        3 * BLOCK
+    );
+    assert!(
+        p.json()
+            .contains("\"file_data/preflight_reduction\":{\"count\":4,")
+    );
+    assert!(
+        p.json()
+            .contains("\"file_data/completed_batch\":{\"count\":3,")
+    );
+    assert_eq!(fs.statfs().unwrap().free_blocks, 1);
+    drop(fs);
+    d.crash();
+    let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(fs.read_file(id, 0, 3 * BLOCK).unwrap(), vec![8; 3 * BLOCK]);
+    fs.unlink(ROOT, b"full").unwrap();
+    assert_eq!(fs.statfs().unwrap().free_blocks, 3561);
+}
+
+#[test]
+fn separate_eof_tail_needs_two_spare_blocks() {
+    let d = Shared::new(&fixture(FormatRevision::Two, None));
+    let mut fs = ReadWriteFs::from_device(d.clone(), OpenOptions::default()).unwrap();
+    let tail = fs.create(ROOT, b"tail", false).unwrap();
+    fs.write_file(tail, 0, b"old").unwrap();
+    let filler = fs.create(ROOT, b"filler", false).unwrap();
+    let bytes = (fs.statfs().unwrap().free_blocks as usize - 1) * BLOCK;
+    let mut offset = 0;
+    while offset < bytes {
+        let count = (bytes - offset).min(1024 * 1024);
+        assert_eq!(
+            fs.write_file(filler, offset as u64, &vec![1; count])
+                .unwrap(),
+            count
+        );
+        offset += count;
+        d.0.borrow_mut().sim.clear_trace();
+    }
+    d.arm(usize::MAX, false);
+    assert!(matches!(
+        fs.write_file(tail, 2 * BLOCK as u64, b"new"),
+        Err(FsError::NoSpace)
+    ));
+    assert_eq!(d.0.borrow().mutations, 0);
+    assert_eq!(fs.statfs().unwrap().free_blocks, 1);
+    fs.truncate(filler, (bytes - BLOCK) as u64).unwrap();
+    assert_eq!(fs.statfs().unwrap().free_blocks, 2);
+    assert_eq!(fs.write_file(tail, 2 * BLOCK as u64, b"new").unwrap(), 3);
+    let mut expected = vec![0; 2 * BLOCK + 3];
+    expected[..3].copy_from_slice(b"old");
+    expected[2 * BLOCK..].copy_from_slice(b"new");
+    drop(fs);
+    d.crash();
+    let mut fs = ReadWriteFs::from_device(d, OpenOptions::default()).unwrap();
+    assert_eq!(fs.read_file(tail, 0, expected.len()).unwrap(), expected);
+    fs.unlink(ROOT, b"tail").unwrap();
+    fs.unlink(ROOT, b"filler").unwrap();
+    assert_eq!(fs.statfs().unwrap().free_blocks, 3561);
 }

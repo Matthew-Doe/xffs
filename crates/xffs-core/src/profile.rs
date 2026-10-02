@@ -30,18 +30,19 @@ impl Default for Metric {
 }
 impl Metric {
     fn add(&mut self, ns: u64, bytes: u64, failed: bool) {
-        self.count += 1;
-        self.bytes += bytes;
-        self.errors += u64::from(failed);
-        self.ns += u128::from(ns);
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.errors = self.errors.saturating_add(u64::from(failed));
+        self.ns = self.ns.saturating_add(u128::from(ns));
         self.max_ns = self.max_ns.max(ns);
-        self.buckets[ns.max(1).ilog2() as usize] += 1;
+        let bucket = &mut self.buckets[ns.max(1).ilog2() as usize];
+        *bucket = bucket.saturating_add(1);
     }
     fn percentile(&self, percent: u64) -> u64 {
-        let needed = (self.count * percent).div_ceil(100);
-        let mut count = 0;
+        let needed = (u128::from(self.count) * u128::from(percent)).div_ceil(100);
+        let mut count = 0u128;
         for (i, bucket) in self.buckets.iter().enumerate() {
-            count += bucket;
+            count += u128::from(*bucket);
             if count >= needed {
                 return 1u64
                     .checked_shl(i as u32 + 1)
@@ -81,6 +82,14 @@ impl Drop for Span {
     }
 }
 impl Profiler {
+    pub(crate) fn event(&self, name: &'static str, bytes: u64) {
+        self.0
+            .lock()
+            .unwrap()
+            .entry(name)
+            .or_default()
+            .add(0, bytes, false);
+    }
     pub(crate) fn span(&self, name: &'static str, bytes: u64) -> Span {
         Span {
             profiler: self.clone(),
