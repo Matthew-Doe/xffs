@@ -15,6 +15,17 @@ pub struct ReadWriteFs<D: BlockDevice = ImageDevice> {
     opens: BTreeMap<InodeId, u64>,
     profile: Option<crate::profile::Profiler>,
 }
+struct PreparedTransaction {
+    payload: Vec<Block>,
+    committed: [Block; 2],
+    clean: [Block; 2],
+    clean_sequence: u64,
+}
+struct PreparedEdit {
+    edit: Edit,
+    memory: usize,
+    transaction: PreparedTransaction,
+}
 impl ReadWriteFs<ImageDevice> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, OpenOptions::default())
@@ -116,8 +127,15 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         images: &BTreeMap<u64, Block>,
         data: &[(u64, Block)],
     ) -> Result<()> {
-        let _commit = crate::profile::span(&self.profile, "commit/total");
-        let preflight = crate::profile::span(&self.profile, "commit/preflight");
+        let prepared = self.prepare_transaction(images, data)?;
+        self.execute_transaction(images, data, prepared)
+    }
+    fn prepare_transaction(
+        &self,
+        images: &BTreeMap<u64, Block>,
+        data: &[(u64, Block)],
+    ) -> Result<PreparedTransaction> {
+        let _preflight = crate::profile::span(&self.profile, "commit/preflight");
         self.healthy()?;
         if images.is_empty() || images.len() > 256 {
             return Err(FsError::TooBig);
@@ -169,7 +187,42 @@ impl<D: BlockDevice> ReadWriteFs<D> {
                 "fresh distinct data target",
             )?;
         }
-        drop(preflight);
+        let encode_controls = |control: JournalControl| -> Result<[Block; 2]> {
+            Ok([
+                with_revision(control.encode(1)?, FormatRevision::Two),
+                with_revision(control.encode(2)?, FormatRevision::Two),
+            ])
+        };
+        Ok(PreparedTransaction {
+            payload,
+            committed: encode_controls(JournalControl {
+                sequence,
+                committed: true,
+                count: images.len() as u32,
+                checksum,
+            })?,
+            clean: encode_controls(JournalControl {
+                sequence: clean_sequence,
+                committed: false,
+                count: 0,
+                checksum: 0,
+            })?,
+            clean_sequence,
+        })
+    }
+    fn execute_transaction(
+        &mut self,
+        images: &BTreeMap<u64, Block>,
+        data: &[(u64, Block)],
+        prepared: PreparedTransaction,
+    ) -> Result<()> {
+        let _commit = crate::profile::span(&self.profile, "commit/total");
+        let PreparedTransaction {
+            payload,
+            committed,
+            clean,
+            clean_sequence,
+        } = prepared;
         let result = (|| {
             let timer = crate::profile::span(&self.profile, "commit/data_write");
             for (n, b) in data {
@@ -191,12 +244,10 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             self.device().flush()?;
             drop(timer);
             let timer = crate::profile::span(&self.profile, "commit/publish");
-            self.controls(JournalControl {
-                sequence,
-                committed: true,
-                count: images.len() as u32,
-                checksum,
-            })?;
+            for (i, block) in committed.iter().enumerate() {
+                self.device().write_at((i as u64 + 1) * 4096, block)?;
+                self.device().flush()?;
+            }
             drop(timer);
             let timer = crate::profile::span(&self.profile, "commit/checkpoint_write");
             for (n, b) in images {
@@ -207,12 +258,10 @@ impl<D: BlockDevice> ReadWriteFs<D> {
             self.device().flush()?;
             drop(timer);
             let _timer = crate::profile::span(&self.profile, "commit/retire");
-            self.controls(JournalControl {
-                sequence: clean_sequence,
-                committed: false,
-                count: 0,
-                checksum: 0,
-            })?;
+            for (i, block) in clean.iter().enumerate() {
+                self.device().write_at((i as u64 + 1) * 4096, block)?;
+                self.device().flush()?;
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -495,7 +544,11 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         edit.nodes.insert(node.inode.id.index, node);
         Ok(())
     }
-    fn finish(&mut self, mut edit: Edit) -> Result<()> {
+    fn finish(&mut self, edit: Edit) -> Result<()> {
+        let prepared = self.prepare_edit(edit)?;
+        self.execute_edit(prepared)
+    }
+    fn prepare_edit(&mut self, mut edit: Edit) -> Result<PreparedEdit> {
         let mut memory = self.view.memory_used;
         for (&index, node) in &edit.nodes {
             let old = self.view.nodes.get(&index).map(node_memory).unwrap_or(0);
@@ -535,7 +588,20 @@ impl<D: BlockDevice> ReadWriteFs<D> {
         for (n, _) in &edit.data {
             require(edit.bits.get(n) == Some(&true), "allocated data target")?;
         }
-        self.commit(&edit.images, &edit.data)?;
+        let transaction = self.prepare_transaction(&edit.images, &edit.data)?;
+        Ok(PreparedEdit {
+            edit,
+            memory,
+            transaction,
+        })
+    }
+    fn execute_edit(&mut self, prepared: PreparedEdit) -> Result<()> {
+        let PreparedEdit {
+            edit,
+            memory,
+            transaction,
+        } = prepared;
+        self.execute_transaction(&edit.images, &edit.data, transaction)?;
         for (n, set) in edit.bits {
             let was = self.used(n);
             if set {
